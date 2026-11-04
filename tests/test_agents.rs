@@ -751,7 +751,7 @@ fn fzf_gets_the_switcher_bindings_and_the_list() {
     assert_eq!(after(args, "--query"), "notes");
     assert!(after(args, "--header").contains("\x1b[1;7m Codex "));
     assert!(after(args, "--footer").contains("←/→/Tab 切换列表"));
-    assert!(after(args, "--footer").contains("Ctrl-X 归档 · Ctrl-D 删除"));
+    assert!(after(args, "--footer").contains("Ctrl-X 归档（Codex）· Ctrl-D 删除"));
     assert!(args.iter().any(|a| a.starts_with("ctrl-x:transform:") && a.ends_with("--archive {1} {2} {3} {5} footer")));
     assert!(args.iter().any(|a| a.starts_with("ctrl-d:execute(") && a.contains("--delete {1} {2} {3} {4} {5})+transform:") && a.ends_with("--refresh footer")));
 }
@@ -835,7 +835,7 @@ fn update_runs_the_installer_into_its_own_folder() {
     let copy = format!("{}/agents", h.bin);
     fs::copy(AGENTS_BIN, &copy).unwrap();
     h.script("curl", "#!/bin/sh\necho 'echo \"bin=$AGENTS_BIN_DIR\"; exit 7'\n");
-    let out = Command::new(&copy).arg("update").envs(h.env()).env_remove("AGENTS_BIN_DIR").current_dir(&h.work).output().unwrap();
+    let out = retry_busy(|| Command::new(&copy).arg("update").envs(h.env()).env_remove("AGENTS_BIN_DIR").current_dir(&h.work).output());
     assert_eq!(out.status.code(), Some(7));
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), format!("bin={}", h.bin));
 }
@@ -990,41 +990,6 @@ fn exists(path: &str) -> bool {
 }
 
 #[test]
-fn ctrl_x_archives_and_the_archived_list_puts_back() {
-    let h = Home::new();
-    let before = h.files["bbbb"].clone();
-    let out = h.archive_key("resume", "claude", "bbbb");
-    assert!(out.starts_with("reload(") && out.contains("--list all"), "{out}");
-    assert!(out.contains(" 已归档 "), "the archived list appears in the switcher: {out}");
-    // off the lists, into Claude's archive with its subagents folder, the time it had kept
-    assert!(!h.ids("all").contains(&"bbbb".to_string()));
-    assert_eq!(h.archived_ids(), ["bbbb"]);
-    let moved = format!("{}/agents-archive/-game/bbbb.jsonl", h.claude);
-    assert!(exists(&moved) && !exists(&before));
-    assert!(exists(&format!("{}/agents-archive/-game/bbbb/subagents/sub1.jsonl", h.claude)));
-    assert!(!exists(&format!("{}/-game/bbbb", h.projects)));
-    assert_eq!(fs::metadata(&moved).unwrap().modified().unwrap(), UNIX_EPOCH + Duration::from_secs(1_800_000_000 + 3 * 60));
-    // on the archived list: Ctrl-X puts it back where it was
-    let out = h.archive_key("archived", "claude", "bbbb");
-    assert!(out.starts_with("reload("), "{out}");
-    assert!(exists(&before) && exists(&format!("{}/-game/bbbb/subagents/sub1.jsonl", h.projects)));
-    assert!(h.archived_ids().is_empty());
-    assert!(!exists(&format!("{}/agents-archive/-game", h.claude))); // no empty folder left behind
-    assert_eq!(h.ids("all"), ["eeee5555", "bbbb", "dddd4444", "aaaa", "hhhh8888"]);
-}
-
-#[test]
-fn pi_archives_into_its_own_folder() {
-    let h = Home::new();
-    h.archive_key("resume", "pi", "hhhh8888");
-    assert!(exists(&format!("{}/agents-archive/--game--/2026-11-01T09-00-00-000Z_hhhh8888.jsonl", h.pi)));
-    assert!(h.ids("pi").is_empty());
-    assert_eq!(h.archived_ids(), ["hhhh8888"]);
-    h.archive_key("archived", "pi", "hhhh8888");
-    assert_eq!(h.ids("pi"), ["hhhh8888"]);
-}
-
-#[test]
 fn codex_archives_with_its_own_commands() {
     let h = Home::new();
     let log = h.fake_codex(0);
@@ -1057,35 +1022,69 @@ fn codex_archived_sessions_are_listed_and_taken_back_on_enter() {
 }
 
 #[test]
-fn enter_on_an_archived_claude_conversation_brings_it_back() {
+fn nothing_outside_the_agents_transcripts_is_touched() {
     let h = Home::new();
-    h.archive_key("resume", "claude", "aaaa");
-    let (_, launched) = h.run_agents(&["--archived"], "\taaaa\t", "", "");
-    assert_eq!(launched.unwrap(), json!({"cwd": h.work, "argv": ["claude", "--resume", "aaaa"]}));
-    assert!(exists(&h.files["aaaa"]));
-    // Ctrl-N from the archive starts anew and leaves the archived one where it is
-    h.archive_key("resume", "claude", "aaaa");
-    let (_, launched) = h.run_agents(&["--archived"], "\taaaa\t", "ctrl-n", "");
-    assert_eq!(launched.unwrap()["argv"], json!(["claude"]));
-    assert_eq!(h.archived_ids(), ["aaaa"]);
+    let outside = format!("{}/outside.jsonl", h.tmp);
+    fs::write(&outside, "keep me\n").unwrap();
+    for path in [outside.clone(), format!("{}/../outside.jsonl", h.projects), format!("{}/sessions/../outside.jsonl", h.pi)] {
+        h.delete_key("resume", "claude", "x", &path, "y\ny\n");
+        h.delete_key("resume", "pi", "x", &path, "y\ny\n");
+        let out = h.command(&["--archive", "resume", "codex", "x", &path, "footer"]).output().unwrap();
+        assert!(String::from_utf8_lossy(&out.stdout).contains("这不是它的对话记录"));
+    }
+    let not_jsonl = format!("{}/-work/notes.txt", h.projects);
+    fs::write(&not_jsonl, "x").unwrap();
+    h.delete_key("resume", "claude", "x", &not_jsonl, "y\ny\n");
+    assert!(exists(&outside) && exists(&not_jsonl));
+    // a new-conversation row has nothing to archive or delete
+    assert_eq!(h.command(&["--archive", "new", "claude", "", "", "footer"]).output().unwrap().stdout, b"");
+    assert!(stderr(&h.delete_key("new", "claude", "", "", "y\n")).is_empty());
 }
 
 #[test]
-fn the_archived_list_comes_and_goes() {
+fn refresh_shows_the_remembered_list() {
+    let h = Home::new();
+    h.ctx().remember("codex");
+    let out = String::from_utf8_lossy(&h.command(&["--refresh", "inline"]).output().unwrap().stdout).into_owned();
+    assert!(out.starts_with("reload(") && out.contains("--list codex") && out.contains("Ctrl-X 归档"), "{out}");
+}
+
+#[test]
+fn claude_and_pi_have_no_archive_and_agents_makes_none() {
+    let h = Home::new();
+    for (agent, ident, name) in [("claude", "bbbb", "Claude"), ("pi", "hhhh8888", "Pi")] {
+        let out = h.archive_key("resume", agent, ident);
+        assert!(out.starts_with("change-header:") && out.contains(&format!("{name} 自己没有归档")) && out.contains("Ctrl-D 删除"), "{out}");
+    }
+    // nothing moved, nothing made
+    assert!(exists(&h.files["bbbb"]) && exists(&h.files["hhhh8888"]) && exists(&format!("{}/-game/bbbb/subagents/sub1.jsonl", h.projects)));
+    assert!(!exists(&format!("{}/agents-archive", h.claude)) && !exists(&format!("{}/agents-archive", h.pi)));
+    assert!(h.archived_ids().is_empty());
+    assert_eq!(h.ctx().lists(), ["all", "claude", "codex", "pi"]);
+}
+
+#[test]
+fn the_archived_list_holds_what_codex_archived() {
     let h = Home::new();
     let ctx = h.ctx();
-    assert_eq!(ctx.lists(), ["all", "claude", "codex", "pi"]);
     ctx.remember("archived");
     assert_eq!(ctx.remembered(), "all"); // nothing archived: no such list
-    h.archive_key("resume", "pi", "hhhh8888");
+    let archived = format!("{}/archived_sessions/rollout-2026-11-03T10-00-00-dddd4444.jsonl", h.codex);
+    fs::create_dir_all(dirname(&archived)).unwrap();
+    fs::rename(&h.files["dddd4444"], &archived).unwrap();
     assert_eq!(ctx.lists(), ["all", "claude", "codex", "pi", "archived"]);
     ctx.remember("pi");
     assert!(ctx.cycle(1, true, false, None).contains("--list archived"));
     assert!(ctx.header("archived", true).contains("Enter 取回并接着聊"));
     assert!(!ctx.header("all", true).contains("取回"));
-    // putting back the last one from the archived list goes back to the mixed list
-    let out = h.archive_key("archived", "pi", "hhhh8888");
-    assert!(out.contains("--list all"), "{out}");
+    // Ctrl-X there asks Codex to put it back; Ctrl-D asks Codex to delete it
+    let log = h.fake_codex(0);
+    assert!(h.archive_key("archived", "codex", "dddd4444").starts_with("reload("));
+    h.delete_key("archived", "codex", "dddd4444", &archived, "y\n");
+    assert_eq!(fs::read_to_string(&log).unwrap(), "unarchive dddd4444\ndelete --force dddd4444\n");
+    // once the archive is empty the list goes, back to the mixed one
+    fs::remove_file(&archived).unwrap();
+    assert!(h.archive_key("resume", "codex", "eeee5555").contains("--list all"));
     assert_eq!(ctx.remembered(), "all");
 }
 
@@ -1095,11 +1094,30 @@ fn a_held_conversation_is_neither_archived_nor_deleted() {
     let sessions = format!("{}/sessions", h.claude);
     fs::create_dir_all(&sessions).unwrap();
     fs::write(format!("{sessions}/1.json"), dumps(&json!({"pid": std::process::id(), "sessionId": "aaaa"}), false)).unwrap();
-    let out = h.archive_key("resume", "claude", "aaaa");
-    assert!(out.starts_with("change-header:") && out.contains("这个对话正被另一个 Claude 进程占着，不能归档"), "{out}");
     let out = h.delete_key("resume", "claude", "aaaa", &h.files["aaaa"], "y\n\n");
-    assert!(stderr(&out).contains("不能删除"));
+    assert!(stderr(&out).contains("这个对话正被另一个 Claude 进程占着，不能删除"), "{}", stderr(&out));
     assert!(exists(&h.files["aaaa"]));
+    // a codex that resumed a conversation holds it: it can be neither archived nor deleted. The id is
+    // this test's own: tests running alongside read the same process table.
+    let mut h = h;
+    let (w, day) = (h.work.clone(), h.codex_day.clone());
+    h.add("held7777", &format!("{day}/rollout-2026-11-03T14-00-00-held7777.jsonl"), &[
+        json!({"type": "session_meta", "payload": {"id": "held7777", "cwd": w, "source": "cli"}}),
+        codex_user(json!("still running")),
+    ], false);
+    let codex = format!("{}/fakes/codex", h.tmp);
+    fs::create_dir_all(dirname(&codex)).unwrap();
+    fs::copy(fs::canonicalize("/bin/sh").unwrap(), &codex).unwrap();
+    let mut running = retry_busy(|| Command::new(&codex).args(["-c", "sleep 30; :", "resume", "held7777"]).spawn());
+    std::thread::sleep(Duration::from_millis(200));
+    let log = h.fake_codex(0);
+    let archived = h.archive_key("resume", "codex", "held7777");
+    let deleted = h.delete_key("resume", "codex", "held7777", &h.files["held7777"], "y\n\n");
+    running.kill().unwrap();
+    running.wait().unwrap();
+    assert!(archived.contains("这个对话正被另一个 Codex 进程占着，不能归档"), "{archived}");
+    assert!(stderr(&deleted).contains("不能删除"));
+    assert!(!exists(&log), "codex was not asked to do anything");
 }
 
 #[test]
@@ -1113,52 +1131,23 @@ fn ctrl_d_deletes_only_after_a_yes() {
     assert!(exists(&path));
     let out = h.delete_key("resume", "claude", "bbbb", &path, "y\n");
     assert!(out.status.success());
+    // the transcript and the folder of subagents beside it
     assert!(!exists(&path) && !exists(&format!("{}/-game/bbbb", h.projects)));
     assert!(!h.ids("all").contains(&"bbbb".to_string()));
-    // from the archive too
-    h.archive_key("resume", "pi", "hhhh8888");
-    h.delete_key("archived", "pi", "hhhh8888", &h.path_of("hhhh8888"), "y\n");
-    assert!(h.archived_ids().is_empty() && h.ids("pi").is_empty());
+    // Pi: the transcript, as Pi's own picker deletes it
+    h.delete_key("resume", "pi", "hhhh8888", &h.files["hhhh8888"], "y\n");
+    assert!(!exists(&h.files["hhhh8888"]) && h.ids("pi").is_empty());
 }
 
-#[test]
-fn nothing_outside_the_agents_transcripts_is_touched() {
-    let h = Home::new();
-    let outside = format!("{}/outside.jsonl", h.tmp);
-    fs::write(&outside, "keep me\n").unwrap();
-    for path in [outside.clone(), format!("{}/../outside.jsonl", h.projects), format!("{}/sessions/../outside.jsonl", h.pi)] {
-        h.delete_key("resume", "claude", "x", &path, "y\ny\n");
-        h.delete_key("resume", "pi", "x", &path, "y\ny\n");
-        let out = h.command(&["--archive", "resume", "claude", "x", &path, "footer"]).output().unwrap();
-        assert!(String::from_utf8_lossy(&out.stdout).contains("这不是它的对话记录"));
+/// Runs a program just written: another test's fork may hold it open for a moment (ETXTBSY).
+fn retry_busy<T>(mut run: impl FnMut() -> std::io::Result<T>) -> T {
+    for _ in 0..50 {
+        match run() {
+            Err(e) if e.raw_os_error() == Some(26) => std::thread::sleep(Duration::from_millis(20)),
+            other => return other.unwrap(),
+        }
     }
-    let not_jsonl = format!("{}/-work/notes.txt", h.projects);
-    fs::write(&not_jsonl, "x").unwrap();
-    h.delete_key("resume", "claude", "x", &not_jsonl, "y\ny\n");
-    assert!(exists(&outside) && exists(&not_jsonl));
-    // a new-conversation row has nothing to archive or delete
-    assert_eq!(h.command(&["--archive", "new", "claude", "", "", "footer"]).output().unwrap().stdout, b"");
-    assert!(stderr(&h.delete_key("new", "claude", "", "", "y\n")).is_empty());
-}
-
-#[test]
-fn archiving_never_overwrites() {
-    let h = Home::new();
-    let clash = format!("{}/agents-archive/-work/aaaa.jsonl", h.claude);
-    fs::create_dir_all(dirname(&clash)).unwrap();
-    fs::write(&clash, "an older copy\n").unwrap();
-    let out = h.archive_key("resume", "claude", "aaaa");
-    assert!(out.contains("那里已经有同名的记录"), "{out}");
-    assert!(exists(&h.files["aaaa"]));
-    assert_eq!(fs::read_to_string(&clash).unwrap(), "an older copy\n");
-}
-
-#[test]
-fn refresh_shows_the_remembered_list() {
-    let h = Home::new();
-    h.ctx().remember("codex");
-    let out = String::from_utf8_lossy(&h.command(&["--refresh", "inline"]).output().unwrap().stdout).into_owned();
-    assert!(out.starts_with("reload(") && out.contains("--list codex") && out.contains("Ctrl-X 归档"), "{out}");
+    run().unwrap()
 }
 
 fn dirname(path: &str) -> String {
@@ -1175,15 +1164,14 @@ fn a_pi_running_in_the_folder_keeps_its_conversations_in_place() {
     let pi = format!("{}/fakes/pi", h.tmp);
     fs::create_dir_all(dirname(&pi)).unwrap();
     fs::copy(fs::canonicalize("/bin/sh").unwrap(), &pi).unwrap();
-    let mut running = Command::new(&pi).args(["-c", "sleep 30; :"]).current_dir(&h.game).spawn().unwrap();
+    let mut running = retry_busy(|| Command::new(&pi).args(["-c", "sleep 30; :"]).current_dir(&h.game).spawn());
     std::thread::sleep(Duration::from_millis(200));
-    let out = h.archive_key("resume", "pi", "hhhh8888");
     let deleted = h.delete_key("resume", "pi", "hhhh8888", &h.files["hhhh8888"], "y\n\n");
     running.kill().unwrap();
     running.wait().unwrap();
-    assert!(out.contains("这个目录里有 Pi 在运行，可能正开着这个对话，不能归档"), "{out}");
-    assert!(stderr(&deleted).contains("不能删除"));
+    assert!(stderr(&deleted).contains("这个目录里有 Pi 在运行，可能正开着这个对话，不能删除"), "{}", stderr(&deleted));
     assert!(exists(&h.files["hhhh8888"]));
     // once it is gone, it can go
-    assert!(h.archive_key("resume", "pi", "hhhh8888").starts_with("reload("));
+    h.delete_key("resume", "pi", "hhhh8888", &h.files["hhhh8888"], "y\n");
+    assert!(!exists(&h.files["hhhh8888"]));
 }

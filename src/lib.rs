@@ -21,7 +21,7 @@ const HELP: &str = "agents: pick a Claude Code, Codex or Pi conversation, from a
 
   agents                          the list you looked at last (all agents at first)
   agents --all | --claude | --codex | --pi   start on that list (←/→ switch in the list)
-  agents --archived               the conversations you archived
+  agents --archived               the Codex conversations you archived
   agents <words>                  start with that filter
   agents .                        only conversations in this folder (and below)
   agents new [claude|codex|pi] [dir]   a new conversation (no dir: pick one)
@@ -35,9 +35,9 @@ Pi). With nothing typed, → moves to the next list and ← back; once you type,
 text again. Tab / Shift-Tab switch lists either way. Enter resumes in the conversation's own folder,
 Ctrl-O forks it (a copy to go on from, the original stays as it was), Ctrl-N starts a new one
 with the same agent in that folder. When the agent exits you are back where you were.
-Ctrl-X archives a conversation: it leaves the lists but is kept, and the 已归档 (archived) list
-brings it back (Ctrl-X there, or Enter to go on with it). Ctrl-D deletes one for good, once you
-answer y. ● marks a conversation a running agent holds: it can be forked, not resumed, archived
+Ctrl-X archives a Codex conversation with Codex's own archive: it leaves the lists, and the
+已归档 (archived) list brings it back (Ctrl-X there, or Enter to go on with it). Claude Code and Pi
+have no archive, and agents makes none. Ctrl-D deletes a conversation for good, once you answer y. ● marks a conversation a running agent holds: it can be forked, not resumed, archived
 or deleted.";
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -53,9 +53,9 @@ const FZF_FOOTER: (u32, u32) = (0, 65); // --footer: key help under the list, th
 const NEED_FZF: &str = "需要 fzf：重新运行安装命令，或从 https://github.com/junegunn/fzf 安装";
 const SWITCH_HELP: &str = "←/→/Tab 切换列表 · ";
 const ACTION_HELP: &str = "Enter 恢复 · Ctrl-O 分支 · Ctrl-N 同目录新建 · ";
-const TIDY_HELP: &str = "Ctrl-X 归档 · Ctrl-D 删除 · ";
+const TIDY_HELP: &str = "Ctrl-X 归档（Codex）· Ctrl-D 删除 · ";
 const TAIL_HELP: &str = "Ctrl-/ 预览 · ● 正被占用";
-const ARCHIVED_HELP: &str = "已归档：Enter 取回并接着聊 · Ctrl-X 放回列表 · Ctrl-D 永久删除";
+const ARCHIVED_HELP: &str = "Codex 归档的对话：Enter 取回并接着聊 · Ctrl-X 放回列表 · Ctrl-D 永久删除";
 
 fn name_of(agent: &str) -> &'static str {
     match agent {
@@ -865,7 +865,6 @@ pub struct Ctx {
     pub claude_home: String,
     pub codex_home: String,
     pub pi_sessions: String,
-    pi_home: String,
     state: String,
     /// `agents .`: only this folder and below (travels to fzf's reloads in the environment).
     pub here: Option<String>,
@@ -903,7 +902,6 @@ impl Ctx {
             claude_home,
             codex_home,
             pi_sessions,
-            pi_home,
         }
     }
 
@@ -915,27 +913,23 @@ impl Ctx {
         }
     }
 
-    /// Where archived conversations go. Codex has its own archive; for Claude and Pi it is a folder
-    /// beside their transcripts, on the same disk (moving there is a rename) and out of their sight.
-    pub fn archive_root(&self, agent: &str) -> String {
-        match agent {
-            "claude" => join(&self.claude_home, "agents-archive"),
-            "codex" => join(&self.codex_home, "archived_sessions"),
-            _ => join(&self.pi_home, "agents-archive"),
-        }
+    /// Where an agent keeps what it archived. Only Codex has an archive of its own; agents makes
+    /// none for the others, so Claude Code's and Pi's conversations are never moved.
+    pub fn archive_root(&self, agent: &str) -> Option<String> {
+        (agent == "codex").then(|| join(&self.codex_home, "archived_sessions"))
     }
 
-    fn root(&self, agent: &str, archived: bool) -> String {
+    fn root(&self, agent: &str, archived: bool) -> Option<String> {
         if archived {
             self.archive_root(agent)
         } else {
-            self.session_root(agent)
+            Some(self.session_root(agent))
         }
     }
 
     /// One agent's conversations, on its lists or in the archive.
     fn read_agent(&self, agent: &'static str, archived: bool) -> Vec<Conversation> {
-        let root = self.root(agent, archived);
+        let Some(root) = self.root(agent, archived) else { return Vec::new() };
         let mut out = Vec::new();
         match agent {
             "claude" => {
@@ -961,13 +955,7 @@ impl Ctx {
                 });
             }
         }
-        if archived {
-            out.iter_mut().for_each(|r| r.archived = true);
-        } else {
-            // a session folder set up around the archive must not list what is archived
-            let archive = format!("{}/", self.archive_root(agent).trim_end_matches('/'));
-            out.retain(|r| !r.path.starts_with(&archive));
-        }
+        out.iter_mut().for_each(|r| r.archived = archived);
         out
     }
 
@@ -1093,7 +1081,7 @@ impl Ctx {
 
     /// Whether anything is archived: the archived list is there only then.
     pub fn has_archived(&self) -> bool {
-        AGENTS.iter().any(|agent| walk(&self.archive_root(agent), &is_jsonl, &mut |_, _| true))
+        AGENTS.iter().filter_map(|agent| self.archive_root(agent)).any(|root| walk(&root, &is_jsonl, &mut |_, _| true))
     }
 
     /// A list worth showing: the mixed one always, an agent's when it is present, the archive when it holds something.
@@ -1227,9 +1215,8 @@ impl Ctx {
         if !path.starts_with('/') || !is_jsonl(&path) {
             return None;
         }
-        // the archive first: it may sit inside a session folder set up around it
         for archived in [true, false] {
-            let root = normpath(&self.root(agent, archived));
+            let Some(root) = self.root(agent, archived).map(|root| normpath(&root)) else { continue };
             if let Some(rel) = path.strip_prefix(&format!("{}/", root.trim_end_matches('/'))) {
                 return Some((archived, rel.to_string()));
             }
@@ -1237,14 +1224,14 @@ impl Ctx {
         None
     }
 
-    /// Why this conversation may not be moved or deleted now, if a running agent may hold it.
+    /// Why this conversation may not be archived or deleted now, if a running agent may hold it.
     fn holder(&self, agent: &'static str, id: &str, path: &str) -> Option<String> {
         let name = name_of(agent);
         if self.is_held(agent, id) {
             return Some(format!("这个对话正被另一个 {name} 进程占着"));
         }
-        // a Pi working in the conversation's folder may be the one that has it open: moving the file
-        // away under it would leave it writing a headless fragment where the transcript was
+        // a Pi working in the conversation's folder may be the one that has it open: deleting the file
+        // under it would leave it writing a headless fragment where the transcript was
         if agent == "pi" {
             let cwd = self.read_one(agent, path).map(|c| realpath(&c.cwd))?;
             if pi_folders().iter().any(|folder| realpath(folder) == cwd) {
@@ -1272,33 +1259,17 @@ impl Ctx {
         Err(format!("codex {} 出错：{last}", args[0]))
     }
 
-    /// Takes a conversation off the lists into the archive (`to_archive`), or back.
+    /// Takes a Codex conversation off the lists into Codex's archive (`to_archive`), or back.
     pub fn archive(&self, agent: &'static str, id: &str, path: &str, to_archive: bool) -> Result<(), String> {
-        let (archived, rel) = self.place(agent, path).ok_or_else(|| "这不是它的对话记录".to_string())?;
+        if agent != "codex" {
+            return Err(format!("{} 自己没有归档，agents 也不替它做：不要了可以按 Ctrl-D 删除", name_of(agent)));
+        }
+        let (archived, _) = self.place(agent, path).ok_or_else(|| "这不是它的对话记录".to_string())?;
         if archived == to_archive {
             return Ok(());
         }
-        if agent == "codex" {
-            // Codex keeps its own index of what is archived: let it do the moving
-            return self.codex(&[if to_archive { "archive" } else { "unarchive" }, id]);
-        }
-        let from = join(&self.root(agent, archived), &rel);
-        let to = join(&self.root(agent, to_archive), &rel);
-        move_file(&from, &to)?;
-        // Claude keeps a conversation's subagents and large tool results in a folder of the same name
-        let (from_dir, to_dir) = (from.trim_end_matches(".jsonl"), to.trim_end_matches(".jsonl"));
-        if agent == "claude" && is_dir(from_dir) {
-            if let Err(e) = move_dir(from_dir, to_dir) {
-                // all of it or none of it: a transcript apart from its folder would lose its subagents
-                let _ = fs::rename(&to, &from);
-                return Err(e);
-            }
-        }
-        if archived {
-            // the folder it came from in the archive, if that leaves it empty
-            let _ = fs::remove_dir(dirname(&from));
-        }
-        Ok(())
+        // Codex keeps its own index of what is archived: let it do the moving
+        self.codex(&[if to_archive { "archive" } else { "unarchive" }, id])
     }
 
     /// Deletes a conversation for good, on the lists or in the archive.
@@ -1308,14 +1279,13 @@ impl Ctx {
             // agents has asked already; codex asks only where it has a terminal of its own
             return self.codex(&["delete", "--force", id]);
         }
-        let file = join(&self.root(agent, archived), &rel);
+        let file = join(&self.root(agent, archived).unwrap_or_default(), &rel);
+        // the transcript, as Pi's own session picker deletes one
         fs::remove_file(&file).map_err(|e| format!("删不掉 {file}：{}", strerror(&e)))?;
+        // Claude keeps a conversation's subagents and large tool results in a folder of the same name
         let folder = file.trim_end_matches(".jsonl");
         if agent == "claude" && is_dir(folder) {
             let _ = fs::remove_dir_all(folder);
-        }
-        if archived {
-            let _ = fs::remove_dir(dirname(&file));
         }
         Ok(())
     }
@@ -1328,6 +1298,9 @@ impl Ctx {
             "archived" => false,
             _ => return String::new(), // a new-conversation row: nothing to archive
         };
+        if agent != "codex" {
+            return self.warn(footer, &format!("{} 自己没有归档，agents 也不替它做：不要了可以按 Ctrl-D 删除", name_of(agent)));
+        }
         if let Some(why) = self.holder(agent, id, path).filter(|_| to_archive) {
             return self.warn(footer, &format!("{why}，不能归档：先在那边退出"));
         }
@@ -1525,36 +1498,6 @@ fn pause() {
     let _ = write!(io::stderr(), "按回车返回");
     let _ = io::stderr().flush();
     let _ = io::stdin().read_line(&mut String::new());
-}
-
-fn refuse_existing(to: &str) -> Result<(), String> {
-    if fs::symlink_metadata(to).is_ok() {
-        return Err(format!("那里已经有同名的记录：{to}"));
-    }
-    if let Err(e) = fs::create_dir_all(dirname(to)) {
-        return Err(format!("建不了目录 {}：{}", dirname(to), strerror(&e)));
-    }
-    Ok(())
-}
-
-/// Moves a transcript, keeping its time (the lists are newest first). Across disks it is copied.
-fn move_file(from: &str, to: &str) -> Result<(), String> {
-    refuse_existing(to)?;
-    match fs::rename(from, to) {
-        Ok(()) => Ok(()),
-        Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
-            let when = fs::metadata(from).and_then(|m| m.modified()).map_err(|e| strerror(&e))?;
-            fs::copy(from, to).map_err(|e| format!("复制不了 {from}：{}", strerror(&e)))?;
-            let _ = fs::File::options().write(true).open(to).and_then(|f| f.set_modified(when));
-            fs::remove_file(from).map_err(|e| format!("删不掉 {from}：{}", strerror(&e)))
-        }
-        Err(e) => Err(format!("移不动 {from}：{}", strerror(&e))),
-    }
-}
-
-fn move_dir(from: &str, to: &str) -> Result<(), String> {
-    refuse_existing(to)?;
-    fs::rename(from, to).map_err(|e| format!("移不动 {from}：{}", strerror(&e)))
 }
 
 fn strerror(error: &io::Error) -> String {

@@ -19,7 +19,7 @@
     1天前    [Claude] ~/code/notes               整理会议记录  · 整理这周的会议记录
     2天前    [Codex]  ~/code/shop-api            给订单列表加分页
 ────────────────────────────────────────────────────────────────────
- ←/→/Tab 切换列表 · Enter 恢复 · Ctrl-O 分支 · Ctrl-N 同目录新建 · Ctrl-X 归档 · Ctrl-D 删除 · Ctrl-/ 预览 · ● 正被占用
+ ←/→/Tab 切换列表 · Enter 恢复 · Ctrl-O 分支 · Ctrl-N 同目录新建 · Ctrl-X 归档（Codex）· Ctrl-D 删除 · Ctrl-/ 预览 · ● 正被占用
 ╭──────────────────────────────────────────────────────────────────╮
 │ Codex · ~/code/blog · 更新于 50分钟前 · b2                       │
 │                                                                  │
@@ -41,7 +41,7 @@
 - **选中就能接着聊**：直接在对话原来的目录里启动 agent，退出后你还在原来的位置。
 - **能搜索**：标题、目录和第一句话都能搜到。
 - **能分支、能新建**：从旧对话复制一份接着聊，或者在同一个目录新开一个。
-- **能归档、能删除**：不想再看到的对话按 Ctrl-X 收起来，随时能放回；确定不要的按 Ctrl-D 删掉。
+- **能删除、能归档**：确定不要的对话按 Ctrl-D 删掉；Codex 的对话还能按 Ctrl-X 用它自带的归档收起来，随时能放回。
 - **知道谁正被占用**：正在别处运行的对话会标上 ●，避免两个进程写同一份记录。
 
 ## 安装
@@ -77,7 +77,7 @@ curl -fsSL https://raw.githubusercontent.com/lb-lin/agentsresumeselector/main/in
 | `agents` | 打开上次看的列表（第一次是「全部」），最新的对话在最前 |
 | `agents 弹珠` | 打开时带上搜索词 |
 | `agents --all` / `--claude` / `--codex` / `--pi` | 从切换器里的某个列表开始 |
-| `agents --archived` | 打开「已归档」列表 |
+| `agents --archived` | 打开「已归档」列表（Codex 归档的对话） |
 | `agents .`（或 `--here`） | 只看当前目录（含子目录） |
 | `agents new [claude\|codex\|pi] [目录]` | 新建对话；不给 agent 就用上次看的那个，不给目录就从用过的目录里选，或输入一个路径 |
 | `agents ... -- --model opus` | `--` 后面的参数原样交给 agent |
@@ -91,7 +91,7 @@ curl -fsSL https://raw.githubusercontent.com/lb-lin/agentsresumeselector/main/in
 | Enter | 在对话原来的目录里恢复 |
 | Ctrl-O | 分支：复制出一份新的接着聊，原对话不动 |
 | Ctrl-N | 用同一个 agent 在同一个目录新开一个对话 |
-| Ctrl-X | 归档：从列表里收起来，不删除，可以放回 |
+| Ctrl-X | 归档 Codex 的对话：从列表里收起来，不删除，可以放回 |
 | Ctrl-D | 永久删除，会先问一句，输入 `y` 才删 |
 | ← / → | 搜索框为空时切换列表；输入了字时移动光标 |
 | Tab / Shift-Tab | 随时切换列表（Ctrl-T 同 Tab） |
@@ -108,21 +108,22 @@ curl -fsSL https://raw.githubusercontent.com/lb-lin/agentsresumeselector/main/in
 
 ## 归档和删除
 
-- **Ctrl-X 归档**：对话从列表里消失，记录原样保留。切换器最后会多出「已归档」，在那里：
+只有官方提供了归档的 agent 才能归档，agents 不自己造一套：
+
+- **Ctrl-X 归档（只有 Codex）**：调用 Codex 自带的 `codex archive`，对话移到 `~/.codex/archived_sessions/`，Codex 自己的列表里也看不到了。切换器最后会多出「已归档」，在那里：
   - Ctrl-X：放回原来的列表。
   - Enter / Ctrl-O：先放回，再恢复或分支。
   - Ctrl-D：永久删除。
 - **Ctrl-D 删除**：先显示是哪个对话，输入 `y` 才删，其他输入都算取消。删除后找不回来。
+- Claude Code 和 Pi 没有官方的归档，在它们的对话上按 Ctrl-X 只会提示用 Ctrl-D 删除。
 - 正被占用（●）的对话不能归档，也不能删除：先在那边退出。Pi 的对话，只要它的目录里有 Pi 在运行，也不让动。
-- 归档的记录放在哪：
+- 删除时各自怎么做：
 
-| | 归档到 | 怎么做的 |
-|---|---|---|
-| Claude Code | `~/.claude/agents-archive/<项目>/` | agents 移动 `.jsonl` 和同名文件夹（子 agent、工具输出）；删除时一起删 |
-| Codex | `~/.codex/archived_sessions/` | 调用 Codex 自带的 `codex archive` / `unarchive` / `delete --force`，Codex 自己的索引保持一致 |
-| Pi | `~/.pi/agent/agents-archive/` | agents 移动 `.jsonl` |
-
-Claude Code 和 Pi 自己看不到归档目录，所以 `claude -r`、`pi --resume` 里也不会再出现归档的对话。不想用 agents 了，把文件移回原处就行。
+| | 删除 |
+|---|---|
+| Codex | 调用 Codex 自带的 `codex delete --force`（agents 已经问过了） |
+| Pi | 删掉那个 `.jsonl`，和 Pi 自己在 `pi --resume` 里按 Ctrl+D 删除的效果一样 |
+| Claude Code | 官方没有删除单个对话的命令，agents 删掉 `.jsonl` 和旁边的同名文件夹（子 agent、工具输出）。`~/.claude/file-history/` 里的文件备份留给 Claude 自己清理 |
 
 ## 列表是怎么来的
 
@@ -162,8 +163,6 @@ Pi 单次运行时用的 `--session-dir` 没法知道，那些对话不会列出
 | 低于 0.46 | 不能切换列表，也不能归档、删除；用 `--claude` 这类参数选列表 |
 
 **提示「这个对话正被另一个进程占着」**：先在那边退出；`claude agents` 里的后台会话要先停掉。不想退出的话，在列表里按 Ctrl-O 分出一份。归档和删除也要等它退出。
-
-**归档时提示「那里已经有同名的记录」**：归档目录里已经有一份同名的旧记录。agents 不会覆盖它，先去归档目录看一下要留哪份。
 
 **提示「目录不在了」**：这个对话原来的目录已被移动或删除。把目录放回去，或者在其他目录新开一个对话。
 
