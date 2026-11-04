@@ -113,7 +113,7 @@ curl -fsSL https://raw.githubusercontent.com/lb-lin/agentsresumeselector/main/in
   - Enter / Ctrl-O：先放回，再恢复或分支。
   - Ctrl-D：永久删除。
 - **Ctrl-D 删除**：先显示是哪个对话，输入 `y` 才删，其他输入都算取消。删除后找不回来。
-- 正被占用（●）的对话不能归档，也不能删除：先在那边退出。
+- 正被占用（●）的对话不能归档，也不能删除：先在那边退出。Pi 的对话，只要它的目录里有 Pi 在运行，也不让动。
 - 归档的记录放在哪：
 
 | | 归档到 | 怎么做的 |
@@ -132,7 +132,7 @@ Claude Code 和 Pi 自己看不到归档目录，所以 `claude -r`、`pi --resu
 - **●** 表示对话正被运行中的 agent 占着，这时不能恢复，但可以按 Ctrl-O 分出一份。判断方式：
   - Claude：`~/.claude/sessions` 里的进程记录。
   - Codex：Linux 上看线程写锁；macOS 上只能认出用 `codex resume <id>` 打开的。
-  - Pi：只能认出用 `pi --session <id>` 打开的。
+  - Pi：新版 Pi 运行时会把进程名改成 `pi`，看不出它开着哪个对话，所以不标 ●（老版本用 `pi --session <id>` 打开的能认出）。归档和删除时更保守：只要对话的目录里有 Pi 在运行，就不让动。
 
 ## 它读什么、写什么
 

@@ -1095,7 +1095,7 @@ fn a_held_conversation_is_neither_archived_nor_deleted() {
     fs::create_dir_all(&sessions).unwrap();
     fs::write(format!("{sessions}/1.json"), dumps(&json!({"pid": std::process::id(), "sessionId": "aaaa"}), false)).unwrap();
     let out = h.archive_key("resume", "claude", "aaaa");
-    assert!(out.starts_with("change-header:") && out.contains("正被另一个 Claude 进程占着"), "{out}");
+    assert!(out.starts_with("change-header:") && out.contains("这个对话正被另一个 Claude 进程占着，不能归档"), "{out}");
     let out = h.delete_key("resume", "claude", "aaaa", &h.files["aaaa"], "y\n\n");
     assert!(stderr(&out).contains("不能删除"));
     assert!(exists(&h.files["aaaa"]));
@@ -1162,4 +1162,27 @@ fn refresh_shows_the_remembered_list() {
 
 fn dirname(path: &str) -> String {
     std::path::Path::new(path).parent().unwrap().to_string_lossy().into_owned()
+}
+
+#[test]
+fn a_pi_running_in_the_folder_keeps_its_conversations_in_place() {
+    if !std::path::Path::new("/proc/self/comm").exists() {
+        return; // the folders of processes are read from /proc
+    }
+    let h = Home::new();
+    // Pi names its process `pi` and nothing more; a copy of sh called pi, waiting, does the same
+    let pi = format!("{}/fakes/pi", h.tmp);
+    fs::create_dir_all(dirname(&pi)).unwrap();
+    fs::copy(fs::canonicalize("/bin/sh").unwrap(), &pi).unwrap();
+    let mut running = Command::new(&pi).args(["-c", "sleep 30; :"]).current_dir(&h.game).spawn().unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    let out = h.archive_key("resume", "pi", "hhhh8888");
+    let deleted = h.delete_key("resume", "pi", "hhhh8888", &h.files["hhhh8888"], "y\n\n");
+    running.kill().unwrap();
+    running.wait().unwrap();
+    assert!(out.contains("这个目录里有 Pi 在运行，可能正开着这个对话，不能归档"), "{out}");
+    assert!(stderr(&deleted).contains("不能删除"));
+    assert!(exists(&h.files["hhhh8888"]));
+    // once it is gone, it can go
+    assert!(h.archive_key("resume", "pi", "hhhh8888").starts_with("reload("));
 }

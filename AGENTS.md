@@ -42,7 +42,7 @@ fzf 回调程序自身的内部子命令：
 **数据安全**
 - 对话记录默认只读。只有用户在列表里按 Ctrl-X（归档、放回）或 Ctrl-D（删除，输入 `y` 确认后）时，才会改动那一个对话。
 - 归档和删除只经过 `Ctx::archive` / `Ctx::delete`，它们先用 `Ctx::place` 确认路径是这个 agent 的会话目录或归档目录里的 `.jsonl`，否则拒绝。不要绕过它。
-- 归档绝不覆盖已有文件（`refuse_existing`），正被占用的对话不能归档或删除。Codex 一律交给 `codex archive` / `unarchive` / `delete --force`，不要自己挪它的文件。
+- 归档绝不覆盖已有文件（`refuse_existing`），正被占用的对话不能归档或删除（`Ctx::holder`）。Pi 会把进程名改成 `pi`、抹掉命令行，认不出它开着哪个对话，所以对话目录里有 Pi 在运行就拒绝（`pi_folders`）。Codex 一律交给 `codex archive` / `unarchive` / `delete --force`，不要自己挪它的文件。
 - 除此之外唯一会写的文件是状态目录下的 `mode`。
 - 除了 `agents update`，不要加任何联网行为。
 

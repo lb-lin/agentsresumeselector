@@ -824,6 +824,22 @@ pub fn held_by_command_line(rows: &[Conversation], agent: &str, procs: &[Vec<Str
     held
 }
 
+/// The folders running Pi processes work in (Linux). Pi renames its process to `pi`, which wipes
+/// its command line: which conversation it has open cannot be told, only where it runs.
+pub fn pi_folders() -> Vec<String> {
+    let Ok(entries) = fs::read_dir("/proc") else { return Vec::new() };
+    let mut folders = Vec::new();
+    for pid in entries.flatten().filter_map(|entry| entry.file_name().to_str().and_then(|name| name.parse::<i32>().ok())) {
+        let comm = fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+        if comm.trim_end() == "pi" || runs(&command_line(pid), "pi") {
+            if let Ok(cwd) = fs::read_link(format!("/proc/{pid}/cwd")) {
+                folders.push(cwd.to_string_lossy().into_owned());
+            }
+        }
+    }
+    folders
+}
+
 /// {inode: holder pids} of locks held (Linux: /proc/locks).
 pub fn lock_holders(path: &str) -> HashMap<u64, HashSet<i32>> {
     let mut holders: HashMap<u64, HashSet<i32>> = HashMap::new();
@@ -1221,6 +1237,23 @@ impl Ctx {
         None
     }
 
+    /// Why this conversation may not be moved or deleted now, if a running agent may hold it.
+    fn holder(&self, agent: &'static str, id: &str, path: &str) -> Option<String> {
+        let name = name_of(agent);
+        if self.is_held(agent, id) {
+            return Some(format!("这个对话正被另一个 {name} 进程占着"));
+        }
+        // a Pi working in the conversation's folder may be the one that has it open: moving the file
+        // away under it would leave it writing a headless fragment where the transcript was
+        if agent == "pi" {
+            let cwd = self.read_one(agent, path).map(|c| realpath(&c.cwd))?;
+            if pi_folders().iter().any(|folder| realpath(folder) == cwd) {
+                return Some("这个目录里有 Pi 在运行，可能正开着这个对话".to_string());
+            }
+        }
+        None
+    }
+
     fn is_held(&self, agent: &'static str, id: &str) -> bool {
         let row = Conversation { agent, id: id.to_string(), cwd: String::new(), title: String::new(), path: String::new(), mtime: 0.0, prompt: String::new(), archived: false };
         self.held(std::slice::from_ref(&row)).contains(id)
@@ -1295,8 +1328,8 @@ impl Ctx {
             "archived" => false,
             _ => return String::new(), // a new-conversation row: nothing to archive
         };
-        if to_archive && self.is_held(agent, id) {
-            return self.warn(footer, &format!("这个对话正被另一个 {} 进程占着，不能归档：先在那边退出", name_of(agent)));
+        if let Some(why) = self.holder(agent, id, path).filter(|_| to_archive) {
+            return self.warn(footer, &format!("{why}，不能归档：先在那边退出"));
         }
         if let Err(e) = self.archive(agent, id, path, to_archive) {
             return self.warn(footer, &format!("{}失败：{e}", if to_archive { "归档" } else { "放回" }));
@@ -1314,8 +1347,8 @@ impl Ctx {
             return;
         }
         let name = name_of(agent);
-        if action == "resume" && self.is_held(agent, id) {
-            note(&format!("\n这个对话正被另一个 {name} 进程占着，不能删除：先在那边退出。"));
+        if let Some(why) = self.holder(agent, id, path).filter(|_| action == "resume") {
+            note(&format!("\n{why}，不能删除：先在那边退出。"));
             return pause();
         }
         let title = self.read_one(agent, path).map(|c| c.title).unwrap_or_default();
