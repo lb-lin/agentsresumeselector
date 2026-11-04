@@ -29,12 +29,21 @@ sh .github/build.sh <target>       # 按发布方式构建某个平台（Linux �
 
 `Ctx` 保存所有来自环境的配置（家目录、各 agent 的目录、`PATH`、`AGENTS_HERE`）。新代码通过 `Ctx` 取这些值，不要直接读环境变量，否则测试没法用虚构的目录。
 
-fzf 回调程序自身的内部子命令：`--list <mode>`、`--cycle [next|back] [footer|inline] [arrow]`、`--preview <agent> <path> <id> <cwd>`。
+fzf 回调程序自身的内部子命令：
+- `--list <mode>`：mode 是 `all`、某个 agent，或 `archived`。
+- `--cycle [next|back] [footer|inline] [arrow]`。
+- `--preview <agent> <path> <id> <cwd>`。
+- `--archive <action> <agent> <id> <path> [footer|inline]`（Ctrl-X，fzf 的 `transform`）：归档或放回，输出刷新列表的 fzf 动作。
+- `--delete <action> <agent> <id> <cwd> <path>`（Ctrl-D，fzf 的 `execute`，在终端上问 `y`）。
+- `--refresh [footer|inline]`：重新显示上次看的列表。
 
 ## 不能破坏的约定
 
 **数据安全**
-- 对话记录只读。唯一会写的文件是状态目录下的 `mode`。
+- 对话记录默认只读。只有用户在列表里按 Ctrl-X（归档、放回）或 Ctrl-D（删除，输入 `y` 确认后）时，才会改动那一个对话。
+- 归档和删除只经过 `Ctx::archive` / `Ctx::delete`，它们先用 `Ctx::place` 确认路径是这个 agent 的会话目录或归档目录里的 `.jsonl`，否则拒绝。不要绕过它。
+- 归档绝不覆盖已有文件（`refuse_existing`），正被占用的对话不能归档或删除。Codex 一律交给 `codex archive` / `unarchive` / `delete --force`，不要自己挪它的文件。
+- 除此之外唯一会写的文件是状态目录下的 `mode`。
 - 除了 `agents update`，不要加任何联网行为。
 
 **测试**
@@ -43,7 +52,7 @@ fzf 回调程序自身的内部子命令：`--list <mode>`、`--cycle [next|back
 - 不要向别人正在用的终端发送按键。要测真实的 fzf 交互，自己开一个 pty，并同样设 `AGENTS_DRY_RUN=1`。
 
 **列表行格式**
-- 一行是六个用 Tab 分隔的字段：`action`、`agent`、`id`、`cwd`、`path`、`shown`。fzf 只显示第 6 个，`--preview` 用 `{2} {5} {3} {4}` 取其余字段，`main` 也按这个顺序解析。三处要一起改。
+- 一行是六个用 Tab 分隔的字段：`action`（`new`、`resume`、`archived`）、`agent`、`id`、`cwd`、`path`、`shown`。fzf 只显示第 6 个，`--preview`、`--archive`、`--delete` 的绑定按编号取其余字段，`main` 也按这个顺序解析。这几处要一起改。
 - 进入字段的值不能含 Tab 或换行：路径和 id 过 `text_field` / `plain_field`，标题和第一句话过 `clean`。
 
 **fzf**
@@ -67,7 +76,7 @@ fzf 回调程序自身的内部子命令：`--list <mode>`、`--cycle [next|back
 
 ## 常见改动
 
-**支持新的 agent**：改 `AGENTS`、`MODES`、`name_of`、`color_of`、`Ctx::session_root`、`said_by`、`Ctx::conversations`（加读取函数）、`Ctx::launch`（恢复、分支、新建的命令）、`Ctx::held`。然后补测试，并更新 README 的命令表和「它读什么、写什么」。
+**支持新的 agent**：改 `AGENTS`、`MODES`、`name_of`、`color_of`、`Ctx::session_root`、`Ctx::archive_root`、`said_by`、`Ctx::read_agent`、`Ctx::read_one`、`Ctx::archive` / `Ctx::delete`（它有没有自己的归档命令）、`Ctx::launch`（恢复、分支、新建的命令）、`Ctx::held`。然后补测试，并更新 README 的命令表和「它读什么、写什么」。
 
 **增加发布平台**：目标列表写在四处，要一起改：`install.sh` 的 `case`、`test.yml`、`release.yml`、README 的平台表。先确认 `sh .github/build.sh <target>` 能过：有些目标（riscv64、loongarch64）的 Rust 工具链不自带 musl，链接会失败。
 

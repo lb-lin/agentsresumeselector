@@ -21,6 +21,7 @@ const HELP: &str = "agents: pick a Claude Code, Codex or Pi conversation, from a
 
   agents                          the list you looked at last (all agents at first)
   agents --all | --claude | --codex | --pi   start on that list (←/→ switch in the list)
+  agents --archived               the conversations you archived
   agents <words>                  start with that filter
   agents .                        only conversations in this folder (and below)
   agents new [claude|codex|pi] [dir]   a new conversation (no dir: pick one)
@@ -34,20 +35,27 @@ Pi). With nothing typed, → moves to the next list and ← back; once you type,
 text again. Tab / Shift-Tab switch lists either way. Enter resumes in the conversation's own folder,
 Ctrl-O forks it (a copy to go on from, the original stays as it was), Ctrl-N starts a new one
 with the same agent in that folder. When the agent exits you are back where you were.
-● marks a conversation a running agent holds: it can be forked, not resumed.";
+Ctrl-X archives a conversation: it leaves the lists but is kept, and the 已归档 (archived) list
+brings it back (Ctrl-X there, or Enter to go on with it). Ctrl-D deletes one for good, once you
+answer y. ● marks a conversation a running agent holds: it can be forked, not resumed, archived
+or deleted.";
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const REPO: &str = "lb-lin/agentsresumeselector";
 pub const AGENTS: [&str; 3] = ["claude", "codex", "pi"];
-const MODES: [&str; 4] = ["all", "claude", "codex", "pi"];
+const MODES: [&str; 5] = ["all", "claude", "codex", "pi", "archived"];
 const DIM: &str = "\x1b[2m";
 const RESET: &str = "\x1b[0m";
+const RED: &str = "\x1b[31m";
 const FZF_SWITCH: (u32, u32) = (0, 46); // the transform action, which switching lists needs
 const FZF_WITH_SHELL: (u32, u32) = (0, 51); // --with-shell: the arrows' check runs in sh, whatever $SHELL is
 const FZF_FOOTER: (u32, u32) = (0, 65); // --footer: key help under the list, the switcher alone above it
 const NEED_FZF: &str = "需要 fzf：重新运行安装命令，或从 https://github.com/junegunn/fzf 安装";
-const SWITCH_HELP: &str = "←/→ 切换列表（打字时移动光标）· Tab 随时切换 · ";
-const ACTION_HELP: &str = "Enter 恢复 · Ctrl-O 分支 · Ctrl-N 同目录新建 · Ctrl-/ 预览 · ● 正被占用";
+const SWITCH_HELP: &str = "←/→/Tab 切换列表 · ";
+const ACTION_HELP: &str = "Enter 恢复 · Ctrl-O 分支 · Ctrl-N 同目录新建 · ";
+const TIDY_HELP: &str = "Ctrl-X 归档 · Ctrl-D 删除 · ";
+const TAIL_HELP: &str = "Ctrl-/ 预览 · ● 正被占用";
+const ARCHIVED_HELP: &str = "已归档：Enter 取回并接着聊 · Ctrl-X 放回列表 · Ctrl-D 永久删除";
 
 fn name_of(agent: &str) -> &'static str {
     match agent {
@@ -67,11 +75,16 @@ fn color_of(agent: &str) -> &'static str {
 }
 
 fn label_of(mode: &str) -> &'static str {
-    if mode == "all" {
-        "全部"
-    } else {
-        name_of(mode)
+    match mode {
+        "all" => "全部",
+        "archived" => "已归档",
+        _ => name_of(mode),
     }
+}
+
+/// The agent's name as the 'static string the rows carry; None for anything that is no agent.
+fn agent_named(agent: &str) -> Option<&'static str> {
+    AGENTS.iter().copied().find(|a| *a == agent)
 }
 
 fn say(text: &str) {
@@ -676,11 +689,13 @@ pub struct Conversation {
     pub path: String,
     pub mtime: f64,
     pub prompt: String,
+    /// In the archive, not on the agent's own lists.
+    pub archived: bool,
 }
 
 fn conversation(agent: &'static str, id: &str, cwd: String, title: &str, path: String, prompt: &str) -> Conversation {
     let mtime = mtime_of(&path);
-    Conversation { agent, id: clean(id), cwd, title: clean(title), path, mtime, prompt: clean(prompt) }
+    Conversation { agent, id: clean(id), cwd, title: clean(title), path, mtime, prompt: clean(prompt), archived: false }
 }
 
 fn claude_conversation(path: String, name: &str) -> Option<Conversation> {
@@ -834,6 +849,7 @@ pub struct Ctx {
     pub claude_home: String,
     pub codex_home: String,
     pub pi_sessions: String,
+    pi_home: String,
     state: String,
     /// `agents .`: only this folder and below (travels to fzf's reloads in the environment).
     pub here: Option<String>,
@@ -871,6 +887,7 @@ impl Ctx {
             claude_home,
             codex_home,
             pi_sessions,
+            pi_home,
         }
     }
 
@@ -882,15 +899,58 @@ impl Ctx {
         }
     }
 
-    fn claude_conversations(&self) -> Vec<Conversation> {
-        let root = self.session_root("claude");
+    /// Where archived conversations go. Codex has its own archive; for Claude and Pi it is a folder
+    /// beside their transcripts, on the same disk (moving there is a rename) and out of their sight.
+    pub fn archive_root(&self, agent: &str) -> String {
+        match agent {
+            "claude" => join(&self.claude_home, "agents-archive"),
+            "codex" => join(&self.codex_home, "archived_sessions"),
+            _ => join(&self.pi_home, "agents-archive"),
+        }
+    }
+
+    fn root(&self, agent: &str, archived: bool) -> String {
+        if archived {
+            self.archive_root(agent)
+        } else {
+            self.session_root(agent)
+        }
+    }
+
+    /// One agent's conversations, on its lists or in the archive.
+    fn read_agent(&self, agent: &'static str, archived: bool) -> Vec<Conversation> {
+        let root = self.root(agent, archived);
         let mut out = Vec::new();
-        // subagent transcripts live in <session>/subagents/; only the top level is a conversation
-        for folder in scan(&root).1 {
-            let folder = join(&root, &folder);
-            for name in scan(&folder).0.iter().filter(|name| is_jsonl(name)) {
-                out.extend(claude_conversation(join(&folder, name), name));
+        match agent {
+            "claude" => {
+                // subagent transcripts live in <session>/subagents/; only the top level is a conversation
+                for folder in scan(&root).1 {
+                    let folder = join(&root, &folder);
+                    for name in scan(&folder).0.iter().filter(|name| is_jsonl(name)) {
+                        out.extend(claude_conversation(join(&folder, name), name));
+                    }
+                }
             }
+            "codex" => {
+                let names = self.codex_names();
+                walk(&root, &|name| name.starts_with("rollout-") && is_jsonl(name), &mut |path, _| {
+                    out.extend(codex_conversation(path, &names));
+                    false
+                });
+            }
+            _ => {
+                walk(&root, &is_jsonl, &mut |path, _| {
+                    out.extend(pi_conversation(path));
+                    false
+                });
+            }
+        }
+        if archived {
+            out.iter_mut().for_each(|r| r.archived = true);
+        } else {
+            // a session folder set up around the archive must not list what is archived
+            let archive = format!("{}/", self.archive_root(agent).trim_end_matches('/'));
+            out.retain(|r| !r.path.starts_with(&archive));
         }
         out
     }
@@ -911,34 +971,12 @@ impl Ctx {
         names
     }
 
-    fn codex_conversations(&self) -> Vec<Conversation> {
-        let names = self.codex_names();
-        let mut out = Vec::new();
-        walk(&self.session_root("codex"), &|name| name.starts_with("rollout-") && is_jsonl(name), &mut |path, _| {
-            out.extend(codex_conversation(path, &names));
-            false
-        });
-        out
-    }
-
-    fn pi_conversations(&self) -> Vec<Conversation> {
-        let mut out = Vec::new();
-        walk(&self.pi_sessions, &is_jsonl, &mut |path, _| {
-            out.extend(pi_conversation(path));
-            false
-        });
-        out
-    }
-
     pub fn conversations(&self, mode: &str) -> Vec<Conversation> {
         let mut rows = Vec::new();
+        let archived = mode == "archived";
         for agent in AGENTS {
-            if mode == "all" || mode == agent {
-                rows.extend(match agent {
-                    "claude" => self.claude_conversations(),
-                    "codex" => self.codex_conversations(),
-                    _ => self.pi_conversations(),
-                });
+            if archived || mode == "all" || mode == agent {
+                rows.extend(self.read_agent(agent, archived));
             }
         }
         // a file path with a tab or newline cannot ride in fzf's fields; such a conversation is left out
@@ -1037,9 +1075,25 @@ impl Ctx {
         self.installed(agent) || walk(&self.session_root(agent), &is_jsonl, &mut |_, _| true)
     }
 
+    /// Whether anything is archived: the archived list is there only then.
+    pub fn has_archived(&self) -> bool {
+        AGENTS.iter().any(|agent| walk(&self.archive_root(agent), &is_jsonl, &mut |_, _| true))
+    }
+
+    /// A list worth showing: the mixed one always, an agent's when it is present, the archive when it holds something.
+    fn available(&self, mode: &str) -> bool {
+        match mode {
+            "all" => true,
+            "archived" => self.has_archived(),
+            agent => self.present(agent),
+        }
+    }
+
     pub fn rows_for(&self, mode: &str) -> Vec<String> {
         let rows = self.conversations(mode);
-        let busy = self.held(&rows);
+        let archive = mode == "archived";
+        // nothing runs an archived conversation
+        let busy = if archive { HashSet::new() } else { self.held(&rows) };
         let mut lines = Vec::with_capacity(rows.len() + 3);
         for agent in AGENTS {
             if (mode == "all" || mode == agent) && self.installed(agent) {
@@ -1050,7 +1104,7 @@ impl Ctx {
         for r in &rows {
             let mark = if busy.contains(&r.id) { "●" } else { " " };
             // on the mixed list every row names its agent; on one agent's list the prompt does
-            let who = if mode == "all" { format!("{} ", tag(r.agent)) } else { String::new() };
+            let who = if mode == "all" || archive { format!("{} ", tag(r.agent)) } else { String::new() };
             let title = chars_upto(&r.title, 140);
             // the first thing said rides along (dim, mostly off screen) so it can be searched too
             let said = if !r.prompt.is_empty() && (r.prompt != r.title || title.len() < r.title.len()) {
@@ -1059,7 +1113,8 @@ impl Ctx {
                 String::new()
             };
             let shown = format!("{mark} {} {who}{DIM}{}{RESET} {title}{said}", pad(&ago_from(now, r.mtime), 8), pad(&self.short(&r.cwd), 26));
-            lines.push(format!("resume\t{}\t{}\t{}\t{}\t{shown}", r.agent, r.id, r.cwd, r.path));
+            let action = if r.archived { "archived" } else { "resume" };
+            lines.push(format!("{action}\t{}\t{}\t{}\t{}\t{shown}", r.agent, r.id, r.cwd, r.path));
         }
         lines
     }
@@ -1074,7 +1129,7 @@ impl Ctx {
         let Ok(raw) = fs::read(join(&self.state, "mode")) else { return "all".to_string() };
         let Ok(text) = String::from_utf8(raw) else { return "all".to_string() };
         let mode = text.trim_matches(is_space);
-        if MODES.contains(&mode) && (mode == "all" || self.present(mode)) {
+        if MODES.contains(&mode) && self.available(mode) {
             mode.to_string()
         } else {
             "all".to_string()
@@ -1084,6 +1139,9 @@ impl Ctx {
     pub fn lists(&self) -> Vec<&'static str> {
         let mut order = vec!["all"];
         order.extend(AGENTS.iter().copied().filter(|agent| self.present(agent)));
+        if self.has_archived() {
+            order.push("archived");
+        }
         order
     }
 
@@ -1106,11 +1164,26 @@ impl Ctx {
 
     /// What sits under the input: the switcher, and the key help when there is no footer for it.
     pub fn header(&self, mode: &str, footer: bool) -> String {
-        if footer {
-            self.switcher(mode)
-        } else {
-            format!("{}   {DIM}{SWITCH_HELP}{ACTION_HELP}{RESET}", self.switcher(mode))
+        let mut top = self.switcher(mode);
+        // the keys mean something else on the archived list: say so where the eye is
+        if mode == "archived" {
+            top += &format!("   {DIM}{ARCHIVED_HELP}{RESET}");
         }
+        if !footer {
+            top += &format!("   {DIM}{SWITCH_HELP}{ACTION_HELP}{TIDY_HELP}{TAIL_HELP}{RESET}");
+        }
+        top
+    }
+
+    /// fzf actions that show a list: its rows and the header for it.
+    pub fn show(&self, mode: &str, footer: bool) -> String {
+        // change-header: takes the rest of the line, so it comes last
+        format!("reload({} --list {mode})+change-header:{}", me(), self.header(mode, footer))
+    }
+
+    /// fzf actions that leave the list as it is and say what went wrong under the switcher.
+    fn warn(&self, footer: bool, text: &str) -> String {
+        format!("change-header:{}   {RED}{text}{RESET}", self.header(&self.remembered(), footer))
     }
 
     /// → / ← (or Tab / Shift-Tab): the next (or previous) list, skipping absent agents. The list shown is
@@ -1126,8 +1199,146 @@ impl Ctx {
             None => "all",
         };
         self.remember(nxt);
-        // change-header: takes the rest of the line, so it comes last
-        format!("reload({} --list {nxt})+change-header:{}", me(), self.header(nxt, footer))
+        self.show(nxt, footer)
+    }
+
+    // ---------- archiving and deleting ----------
+
+    /// Where a transcript of this agent's lives: (archived, its path below that root). None for any
+    /// other file: archiving and deleting touch the agents' own transcripts and nothing else.
+    fn place(&self, agent: &str, path: &str) -> Option<(bool, String)> {
+        let path = normpath(path);
+        if !path.starts_with('/') || !is_jsonl(&path) {
+            return None;
+        }
+        // the archive first: it may sit inside a session folder set up around it
+        for archived in [true, false] {
+            let root = normpath(&self.root(agent, archived));
+            if let Some(rel) = path.strip_prefix(&format!("{}/", root.trim_end_matches('/'))) {
+                return Some((archived, rel.to_string()));
+            }
+        }
+        None
+    }
+
+    fn is_held(&self, agent: &'static str, id: &str) -> bool {
+        let row = Conversation { agent, id: id.to_string(), cwd: String::new(), title: String::new(), path: String::new(), mtime: 0.0, prompt: String::new(), archived: false };
+        self.held(std::slice::from_ref(&row)).contains(id)
+    }
+
+    fn codex(&self, args: &[&str]) -> Result<(), String> {
+        if !self.installed("codex") {
+            return Err("这台机器上没有 codex".to_string());
+        }
+        let out = Command::new("codex").args(args).stdin(Stdio::null()).output().map_err(|e| format!("运行不了 codex：{}", strerror(&e)))?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let said = String::from_utf8_lossy(&out.stderr).into_owned();
+        let last = said.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with("WARNING")).last().unwrap_or("");
+        Err(format!("codex {} 出错：{last}", args[0]))
+    }
+
+    /// Takes a conversation off the lists into the archive (`to_archive`), or back.
+    pub fn archive(&self, agent: &'static str, id: &str, path: &str, to_archive: bool) -> Result<(), String> {
+        let (archived, rel) = self.place(agent, path).ok_or_else(|| "这不是它的对话记录".to_string())?;
+        if archived == to_archive {
+            return Ok(());
+        }
+        if agent == "codex" {
+            // Codex keeps its own index of what is archived: let it do the moving
+            return self.codex(&[if to_archive { "archive" } else { "unarchive" }, id]);
+        }
+        let from = join(&self.root(agent, archived), &rel);
+        let to = join(&self.root(agent, to_archive), &rel);
+        move_file(&from, &to)?;
+        // Claude keeps a conversation's subagents and large tool results in a folder of the same name
+        let (from_dir, to_dir) = (from.trim_end_matches(".jsonl"), to.trim_end_matches(".jsonl"));
+        if agent == "claude" && is_dir(from_dir) {
+            if let Err(e) = move_dir(from_dir, to_dir) {
+                // all of it or none of it: a transcript apart from its folder would lose its subagents
+                let _ = fs::rename(&to, &from);
+                return Err(e);
+            }
+        }
+        if archived {
+            // the folder it came from in the archive, if that leaves it empty
+            let _ = fs::remove_dir(dirname(&from));
+        }
+        Ok(())
+    }
+
+    /// Deletes a conversation for good, on the lists or in the archive.
+    pub fn delete(&self, agent: &'static str, id: &str, path: &str) -> Result<(), String> {
+        let (archived, rel) = self.place(agent, path).ok_or_else(|| "这不是它的对话记录".to_string())?;
+        if agent == "codex" {
+            // agents has asked already; codex asks only where it has a terminal of its own
+            return self.codex(&["delete", "--force", id]);
+        }
+        let file = join(&self.root(agent, archived), &rel);
+        fs::remove_file(&file).map_err(|e| format!("删不掉 {file}：{}", strerror(&e)))?;
+        let folder = file.trim_end_matches(".jsonl");
+        if agent == "claude" && is_dir(folder) {
+            let _ = fs::remove_dir_all(folder);
+        }
+        if archived {
+            let _ = fs::remove_dir(dirname(&file));
+        }
+        Ok(())
+    }
+
+    /// Ctrl-X (fzf's transform): archive the row, or put an archived one back, and show the list again.
+    pub fn archive_key(&self, action: &str, agent: &str, id: &str, path: &str, footer: bool) -> String {
+        let Some(agent) = agent_named(agent) else { return String::new() };
+        let to_archive = match action {
+            "resume" => true,
+            "archived" => false,
+            _ => return String::new(), // a new-conversation row: nothing to archive
+        };
+        if to_archive && self.is_held(agent, id) {
+            return self.warn(footer, &format!("这个对话正被另一个 {} 进程占着，不能归档：先在那边退出", name_of(agent)));
+        }
+        if let Err(e) = self.archive(agent, id, path, to_archive) {
+            return self.warn(footer, &format!("{}失败：{e}", if to_archive { "归档" } else { "放回" }));
+        }
+        // the archived list goes when its last conversation does
+        let mode = self.remembered();
+        self.remember(&mode);
+        self.show(&mode, footer)
+    }
+
+    /// Ctrl-D (fzf's execute, on the terminal): ask, then delete for good.
+    pub fn delete_key(&self, action: &str, agent: &str, id: &str, cwd: &str, path: &str) {
+        let Some(agent) = agent_named(agent) else { return };
+        if action != "resume" && action != "archived" {
+            return;
+        }
+        let name = name_of(agent);
+        if action == "resume" && self.is_held(agent, id) {
+            note(&format!("\n这个对话正被另一个 {name} 进程占着，不能删除：先在那边退出。"));
+            return pause();
+        }
+        let title = self.read_one(agent, path).map(|c| c.title).unwrap_or_default();
+        note(&format!("\n永久删除这个 {name} 对话？删除后找不回来。\n\n  {} · {}\n", self.short(cwd), chars_upto(&title, 100)));
+        let _ = write!(io::stderr(), "输入 y 确认，其他任意内容取消：");
+        let _ = io::stderr().flush();
+        let mut answer = String::new();
+        let _ = io::stdin().read_line(&mut answer);
+        if !matches!(answer.trim(), "y" | "Y" | "yes") {
+            return;
+        }
+        if let Err(e) = self.delete(agent, id, path) {
+            note(&format!("删除失败：{e}"));
+            pause();
+        }
+    }
+
+    fn read_one(&self, agent: &str, path: &str) -> Option<Conversation> {
+        match agent {
+            "claude" => claude_conversation(path.to_string(), basename(path)),
+            "codex" => codex_conversation(path.to_string(), &self.codex_names()),
+            _ => pi_conversation(path.to_string()),
+        }
     }
 
     /// A conversation's last few exchanges, for the side panel.
@@ -1274,6 +1485,43 @@ fn read_from(path: &str, start: u64, length: u64) -> Option<Vec<u8>> {
     let mut raw = Vec::with_capacity(length as usize);
     file.take(length).read_to_end(&mut raw).ok()?;
     Some(raw)
+}
+
+/// Waits for Enter, so a message stays up before fzf takes the screen back.
+fn pause() {
+    let _ = write!(io::stderr(), "按回车返回");
+    let _ = io::stderr().flush();
+    let _ = io::stdin().read_line(&mut String::new());
+}
+
+fn refuse_existing(to: &str) -> Result<(), String> {
+    if fs::symlink_metadata(to).is_ok() {
+        return Err(format!("那里已经有同名的记录：{to}"));
+    }
+    if let Err(e) = fs::create_dir_all(dirname(to)) {
+        return Err(format!("建不了目录 {}：{}", dirname(to), strerror(&e)));
+    }
+    Ok(())
+}
+
+/// Moves a transcript, keeping its time (the lists are newest first). Across disks it is copied.
+fn move_file(from: &str, to: &str) -> Result<(), String> {
+    refuse_existing(to)?;
+    match fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
+            let when = fs::metadata(from).and_then(|m| m.modified()).map_err(|e| strerror(&e))?;
+            fs::copy(from, to).map_err(|e| format!("复制不了 {from}：{}", strerror(&e)))?;
+            let _ = fs::File::options().write(true).open(to).and_then(|f| f.set_modified(when));
+            fs::remove_file(from).map_err(|e| format!("删不掉 {from}：{}", strerror(&e)))
+        }
+        Err(e) => Err(format!("移不动 {from}：{}", strerror(&e))),
+    }
+}
+
+fn move_dir(from: &str, to: &str) -> Result<(), String> {
+    refuse_existing(to)?;
+    fs::rename(from, to).map_err(|e| format!("移不动 {from}：{}", strerror(&e)))
 }
 
 fn strerror(error: &io::Error) -> String {
@@ -1454,6 +1702,25 @@ pub fn main(argv: Vec<String>) {
             let field = |i: usize| rest.get(i).map_or("", String::as_str);
             return ctx.preview(field(0), field(1), field(2), field(3));
         }
+        Some("--archive") => {
+            // --archive <action> <agent> <id> <path> [footer|inline]
+            let field = |i: usize| rest.get(i).map_or("", String::as_str);
+            let actions = ctx.archive_key(field(0), field(1), field(2), field(3), field(4) != "inline");
+            if !actions.is_empty() {
+                say(&actions);
+            }
+            return;
+        }
+        Some("--delete") => {
+            // --delete <action> <agent> <id> <cwd> <path>
+            let field = |i: usize| rest.get(i).map_or("", String::as_str);
+            return ctx.delete_key(field(0), field(1), field(2), field(3), field(4));
+        }
+        Some("--refresh") => {
+            let mode = ctx.remembered();
+            ctx.remember(&mode);
+            return say(&ctx.show(&mode, !rest.iter().any(|a| a == "inline")));
+        }
         Some("update") => update(&ctx),
         Some("new") => return command_new(&ctx, rest, extra),
         _ => {}
@@ -1496,27 +1763,37 @@ pub fn main(argv: Vec<String>) {
         } else {
             (format!("{forward} arrow"), format!("{back} arrow"))
         };
-        for bind in [format!("right:{right}"), format!("left:{left}"), format!("tab:{forward}"), format!("btab:{back}"), format!("ctrl-t:{forward}")] {
+        // Ctrl-X works without leaving the list; Ctrl-D asks on the terminal first
+        let archive = format!("ctrl-x:transform:{own} --archive {{1}} {{2}} {{3}} {{5}} {layout}");
+        let delete = format!("ctrl-d:execute({own} --delete {{1}} {{2}} {{3}} {{4}} {{5}})+transform:{own} --refresh {layout}");
+        for bind in [format!("right:{right}"), format!("left:{left}"), format!("tab:{forward}"), format!("btab:{back}"), format!("ctrl-t:{forward}"), archive, delete] {
             keys.push("--bind".to_string());
             keys.push(bind);
         }
         ctx.header(&mode, footer)
     } else {
-        format!("{DIM}{ACTION_HELP}{RESET}  （fzf 0.46 以上才能切换列表：运行 agents update）")
+        format!("{DIM}{ACTION_HELP}{TAIL_HELP}{RESET}  （fzf 0.46 以上才能切换列表、归档和删除：运行 agents update）")
     };
     if footer {
         keys.push("--footer".to_string());
-        keys.push(format!("{DIM}{SWITCH_HELP}{ACTION_HELP}{RESET}"));
+        keys.push(format!("{DIM}{SWITCH_HELP}{ACTION_HELP}{TIDY_HELP}{TAIL_HELP}{RESET}"));
     }
     let (_, out) = pick(&ctx.rows_for(&mode), "> ", &words.join(" "), &top, &keys);
     let mut out = out.split('\n');
     let key = out.next().unwrap_or("");
     let Some(row) = out.next().filter(|row| !row.is_empty()) else { return };
     let fields: Vec<&str> = row.split('\t').collect();
-    if fields.len() < 4 || !AGENTS.contains(&fields[1]) {
+    if fields.len() < 5 {
         return;
     }
-    let (action, agent, ident, cwd) = (fields[0], fields[1], fields[2], fields[3]);
+    let Some(agent) = agent_named(fields[1]) else { return };
+    let (action, ident, cwd, path) = (fields[0], fields[2], fields[3], fields[4]);
+    // going on with an archived conversation (or a fork of it) takes it out of the archive first
+    if action == "archived" && key != "ctrl-n" {
+        if let Err(e) = ctx.archive(agent, ident, path, false) {
+            die(&format!("取回失败：{e}"));
+        }
+    }
     if action == "new" {
         return ctx.new_conversation(agent, None, extra);
     }
