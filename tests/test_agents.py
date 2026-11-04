@@ -341,8 +341,8 @@ class Lists(Base):
             self.assertIn(f" {label} ", bar)
         self.assertIn("\033[1;7m Codex ", bar)  # reverse video on the list shown
         self.assertNotIn("\033[1;7m Claude ", bar)
-        self.assertIn("Tab", self.cr.header("all", footer=False))  # no footer: key help rides along
-        self.assertNotIn("Tab", self.cr.header("all", footer=True))
+        self.assertIn("切换列表", self.cr.header("all", footer=False))  # no footer: key help rides along
+        self.assertNotIn("切换列表", self.cr.header("all", footer=True))
 
     def test_cycle_skips_an_agent_with_nothing_here(self):
         shutil.rmtree(self.pi)
@@ -484,10 +484,12 @@ class Commands(Base):
         self.assertIn("ctrl-n,ctrl-o", args)
         self.assertTrue(any(a.startswith("tab:transform:") and a.endswith("--cycle next footer") for a in args))
         self.assertTrue(any(a.startswith("btab:transform:") and a.endswith("--cycle back footer") for a in args))
+        self.assertTrue(any(a.startswith("right:transform:") and a.endswith("--cycle next footer") for a in args))
+        self.assertTrue(any(a.startswith("left:transform:") and a.endswith("--cycle back footer") for a in args))
         self.assertEqual(args[args.index("--query") + 1], "notes")
         bar = args[args.index("--header") + 1]
         self.assertIn("\033[1;7m Codex ", bar)
-        self.assertIn("Tab 切换列表", args[args.index("--footer") + 1])
+        self.assertIn("←/→ 切换列表", args[args.index("--footer") + 1])
 
     def test_this_folder_through_main(self):
         env = {"PWD": self.game}

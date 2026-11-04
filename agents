@@ -2,7 +2,7 @@
 """agents: pick a Claude Code, Codex or Pi conversation, from any folder, and resume it there.
 
   agents                          the list you looked at last (all agents at first)
-  agents --all | --claude | --codex | --pi   start on that list (Tab switches in the list)
+  agents --all | --claude | --codex | --pi   start on that list (←/→ switch in the list)
   agents <words>                  start with that filter
   agents .                        only conversations in this folder (and below)
   agents new [claude|codex|pi] [dir]   a new conversation (no dir: pick one)
@@ -12,7 +12,7 @@
 https://github.com/lb-lin/agentsresumeselector
 
 In the list: the switcher under the input shows which list you are on (all / Claude / Codex /
-Pi); Tab moves to the next, Shift-Tab back. Enter resumes in the conversation's own folder,
+Pi); → (or Tab) moves to the next, ← (or Shift-Tab) back; Ctrl-B / Ctrl-F move in the search text. Enter resumes in the conversation's own folder,
 Ctrl-O forks it (a copy to go on from, the original stays as it was), Ctrl-N starts a new one
 with the same agent in that folder. When the agent exits you are back where you were.
 ● marks a conversation a running agent holds: it can be forked, not resumed.
@@ -28,7 +28,7 @@ import sys
 import time
 import unicodedata
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 REPO = "lb-lin/agentsresumeselector"
 HOME = os.path.expanduser("~")
 CLAUDE_HOME = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude")
@@ -672,7 +672,7 @@ def lists():
     return ["all"] + [a for a in AGENTS if present(a)]
 
 
-KEYS_HELP = "Tab 切换列表 · Enter 恢复 · Ctrl-O 分支 · Ctrl-N 同目录新建 · Ctrl-/ 预览 · ● 正被占用"
+KEYS_HELP = "←/→ 切换列表 · Enter 恢复 · Ctrl-O 分支 · Ctrl-N 同目录新建 · Ctrl-/ 预览 · ● 正被占用"
 
 
 def switcher(mode):
@@ -693,7 +693,7 @@ def header(mode, footer):
 
 
 def cycle(step=1, footer=True):
-    """Tab / Shift-Tab: the next (or previous) list, skipping absent agents. The list shown is the remembered one."""
+    """→ / ←: the next (or previous) list, skipping absent agents. The list shown is the remembered one."""
     order = lists()
     now = remembered()
     nxt = order[(order.index(now) + step) % len(order)] if now in order else "all"
@@ -929,10 +929,12 @@ def main(argv):
     layout = "footer" if footer else "inline"
     if version >= FZF_SWITCH:
         forward, back = f"transform:{me()} --cycle next {layout}", f"transform:{me()} --cycle back {layout}"
-        keys += ["--bind", f"tab:{forward}", "--bind", f"ctrl-t:{forward}", "--bind", f"btab:{back}"]
+        # ←/→ switch lists (the search text keeps Ctrl-B / Ctrl-F to move in it); Tab / Shift-Tab too
+        keys += ["--bind", f"right:{forward}", "--bind", f"left:{back}", "--bind", f"tab:{forward}",
+                 "--bind", f"btab:{back}", "--bind", f"ctrl-t:{forward}"]
         top = header(mode, footer)
     else:
-        top = f"{DIM}{KEYS_HELP.replace('Tab 切换列表 · ', '')}{RESET}  （fzf 0.46 以上才能切换列表：运行 agents update）"
+        top = f"{DIM}{KEYS_HELP.replace('←/→ 切换列表 · ', '')}{RESET}  （fzf 0.46 以上才能切换列表：运行 agents update）"
     if footer:
         keys += ["--footer", f"{DIM}{KEYS_HELP}{RESET}"]
     res = pick(rows_for(mode), "> ", " ".join(words), top, keys)
