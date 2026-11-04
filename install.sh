@@ -3,13 +3,14 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/lb-lin/agentsresumeselector/main/install.sh | sh
 #
-# AGENTS_BIN_DIR   where to install (default ~/.local/bin)
-# AGENTS_REF       branch or tag of this repository to install (default main)
-# AGENTS_SKIP_FZF  set to 1 to leave fzf alone
+# AGENTS_BIN_DIR       where to install (default ~/.local/bin)
+# AGENTS_REF           the release to install, a tag such as v0.9.0 (default the newest)
+# AGENTS_DOWNLOAD_URL  take the program from here instead of the GitHub release
+# AGENTS_SKIP_FZF      set to 1 to leave fzf alone
 set -eu
 
 REPO="lb-lin/agentsresumeselector"
-REF="${AGENTS_REF:-main}"
+REF="${AGENTS_REF:-}"
 BIN="${AGENTS_BIN_DIR:-$HOME/.local/bin}"
 FZF_MIN="0.65"  # --footer, which the list switcher's layout uses
 
@@ -39,23 +40,50 @@ at_least() {
   awk -v a="$1" -v b="$2" 'BEGIN { split(a, x, "."); split(b, y, "."); exit !((x[1] > y[1]) || (x[1] == y[1] && x[2] >= y[2])) }'
 }
 
-command -v python3 >/dev/null 2>&1 || die "python3 is needed (3.8 or newer)"
-# -I: never import modules from the folder the installer runs in
-python3 -I -c 'import sys; sys.exit(sys.version_info < (3, 8))' || die "python3 3.8 or newer is needed"
-
 mkdir -p "$BIN"
 # downloads land next to where they go, so moving them in is a rename, never a half-copied file
 tmp="$(mktemp -d "$BIN/.agents.XXXXXX")" || die "cannot write to $BIN"
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
 # --- agents ---
-say "==> agents ($REF)"
-fetch "https://raw.githubusercontent.com/$REPO/$REF/agents" "$tmp/agents" || die "download failed"
-head -n 1 "$tmp/agents" | grep -q '^#!/usr/bin/env python3' || die "what was downloaded is not the agents script"
-python3 -I -c 'import ast, sys; ast.parse(open(sys.argv[1], encoding="utf-8").read())' "$tmp/agents" || die "the downloaded script does not parse"
-mv "$tmp/agents" "$BIN/agents"
-chmod 755 "$BIN/agents"
-say "    $BIN/agents"
+# a static program for this machine, or, where none is built, compiled here
+case "$(uname -s)/$(uname -m)" in
+  Linux/x86_64|Linux/amd64) target=x86_64-unknown-linux-musl ;;
+  Linux/aarch64|Linux/arm64) target=aarch64-unknown-linux-musl ;;
+  Linux/armv7*|Linux/armv8l) target=armv7-unknown-linux-musleabihf ;;
+  Linux/armv6*) target=arm-unknown-linux-musleabihf ;;
+  Linux/ppc64le) target=powerpc64le-unknown-linux-musl ;;
+  Darwin/x86_64) target=x86_64-apple-darwin ;;
+  Darwin/arm64|Darwin/aarch64) target=aarch64-apple-darwin ;;
+  *) target="" ;;
+esac
+
+if [ -n "$target" ]; then
+  if [ -n "${AGENTS_DOWNLOAD_URL:-}" ]; then base="$AGENTS_DOWNLOAD_URL"
+  elif [ -n "$REF" ]; then base="https://github.com/$REPO/releases/download/$REF"
+  else base="https://github.com/$REPO/releases/latest/download"
+  fi
+  asset="agents-$target"
+  say "==> agents ${REF:-newest} ($target)"
+  fetch "$base/$asset" "$tmp/$asset" || die "download failed: $base/$asset"
+  fetch "$base/SHA256SUMS" "$tmp/agents-sums" || die "download failed: $base/SHA256SUMS"
+  expected="$(grep "  $asset\$" "$tmp/agents-sums" | cut -d' ' -f1)"
+  actual="$(sha256 "$tmp/$asset")"
+  [ -n "$expected" ] || die "the checksum list has no $asset"
+  [ -n "$actual" ] || die "sha256sum or shasum is needed to check the download"
+  [ "$expected" = "$actual" ] || die "checksum mismatch for $asset"
+  chmod 755 "$tmp/$asset"
+  "$tmp/$asset" --version >/dev/null 2>&1 || die "$asset does not run on this machine"
+  mv "$tmp/$asset" "$BIN/agents"
+  say "    $BIN/agents (checksum ok)"
+else
+  command -v cargo >/dev/null 2>&1 || die "no ready-made agents for $(uname -s)/$(uname -m): install Rust (https://rustup.rs) and run this again to compile it here"
+  say "==> agents ${REF:-newest}: no ready-made program for $(uname -s)/$(uname -m), compiling with cargo"
+  # shellcheck disable=SC2086  # the tag words split on purpose
+  cargo install --quiet --locked --root "$tmp/build" --git "https://github.com/$REPO" ${REF:+--tag "$REF"} agents || die "cargo install failed"
+  mv "$tmp/build/bin/agents" "$BIN/agents"
+  say "    $BIN/agents"
+fi
 
 # --- fzf ---
 # agents runs the fzf beside itself when there is one, else the one on PATH: check that one

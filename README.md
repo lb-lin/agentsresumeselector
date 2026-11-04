@@ -24,7 +24,9 @@
 curl -fsSL https://raw.githubusercontent.com/lb-lin/agentsresumeselector/main/install.sh | sh
 ```
 
-装到 `~/.local/bin`（`AGENTS_BIN_DIR` 可改），不需要 root。需要 Python 3.8+；没有 fzf（或版本低于 0.65）时，会从 fzf 的 GitHub 发布页下载对应平台的版本，并核对官方校验和。Linux 和 macOS 都行，常见的 x86_64、arm64、armv7 等架构都支持。以后更新：`agents update`，会装回它现在所在的目录。
+装到 `~/.local/bin`（`AGENTS_BIN_DIR` 可改），不需要 root，也不需要 Python 或 Rust：`agents` 是一个静态链接的可执行文件，下载时核对校验和。没有 fzf（或版本低于 0.65）时，会从 fzf 的 GitHub 发布页下载对应平台的版本，同样核对官方校验和。
+
+现成的程序有 Linux（x86_64、arm64、armv7、armv6、ppc64le）和 macOS（x86_64、arm64）。其他平台上（比如 riscv64、loongarch64、FreeBSD），只要装了 Rust，安装脚本会用 `cargo` 现场编译。以后更新：`agents update`，会装回它现在所在的目录。
 
 ## 用法
 
@@ -74,7 +76,10 @@ rm -r ~/.local/state/agents
 ## 开发
 
 ```sh
-python3 -m unittest discover -s tests
+cargo test                    # 用虚构的 Claude、Codex、Pi 记录和一个假 fzf 跑测试
+cargo build --release         # 程序在 target/release/agents
 ```
+
+打一个 `v*` 标签，CI 就会构建各平台的程序、生成 `SHA256SUMS` 并发布到 GitHub Release，安装脚本从那里下载。
 
 MIT License

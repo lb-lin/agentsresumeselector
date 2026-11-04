@@ -1,0 +1,24 @@
+[package]
+name = "agents"
+version = "0.9.0"
+edition = "2021"
+rust-version = "1.82"
+description = "Pick any Claude Code, Codex or Pi conversation from any folder and resume it there (fzf)"
+license = "MIT"
+repository = "https://github.com/lb-lin/agentsresumeselector"
+
+[dependencies]
+serde_json = "1"
+memmap2 = "0.9"
+memchr = "2"
+libc = "0.2"
+
+[dev-dependencies]
+serde = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
