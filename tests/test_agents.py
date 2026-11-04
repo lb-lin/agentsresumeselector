@@ -69,7 +69,7 @@ def codex_user(text_or_blocks):
 class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        t = self.tmp.name
+        t = os.path.realpath(self.tmp.name)  # macOS: /var/folders is /private/var/folders
         self.claude = os.path.join(t, "claude")
         self.codex = os.path.join(t, "codex")
         self.pi = os.path.join(t, "pi")

@@ -383,7 +383,10 @@ def conversations(mode="all"):
     # `agents .`: this folder and below (the folder travels to fzf's reloads in the environment)
     here = os.environ.get("AGENTS_HERE")
     if here:
-        rows = [r for r in rows if r["cwd"] == here or r["cwd"].startswith(here.rstrip("/") + "/")]
+        # a folder may be named through a symlink (macOS's /var is /private/var): compare both spellings
+        tops = {here.rstrip("/") or "/", os.path.realpath(here)}
+        inside = lambda cwd: any(cwd == top or cwd.startswith(top.rstrip("/") + "/") for top in tops)
+        rows = [r for r in rows if inside(r["cwd"]) or inside(os.path.realpath(r["cwd"]))]
     rows.sort(key=lambda c: c["mtime"], reverse=True)
     return rows
 
