@@ -967,7 +967,8 @@ impl Home {
             .stderr(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        child.stdin.take().unwrap().write_all(answer.as_bytes()).unwrap();
+        // a refusal comes before the question: the program may be gone before the answer is written
+        let _ = child.stdin.take().unwrap().write_all(answer.as_bytes());
         child.wait_with_output().unwrap()
     }
 
