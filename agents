@@ -27,13 +27,29 @@ import sys
 import time
 import unicodedata
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 REPO = "lb-lin/agentsresumeselector"
 HOME = os.path.expanduser("~")
 CLAUDE_HOME = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude")
 CODEX_HOME = os.environ.get("CODEX_HOME") or os.path.join(HOME, ".codex")
-PI_SESSIONS = os.environ.get("PI_CODING_AGENT_SESSION_DIR") or os.path.join(
-    os.environ.get("PI_CODING_AGENT_DIR") or os.path.join(HOME, ".pi", "agent"), "sessions")
+PI_HOME = os.environ.get("PI_CODING_AGENT_DIR") or os.path.join(HOME, ".pi", "agent")
+
+
+def pi_sessions():
+    """Where Pi keeps sessions: $PI_CODING_AGENT_SESSION_DIR, else an absolute sessionDir in its settings, else <dir>/sessions."""
+    if os.environ.get("PI_CODING_AGENT_SESSION_DIR"):
+        return os.environ["PI_CODING_AGENT_SESSION_DIR"]
+    try:
+        with open(os.path.join(PI_HOME, "settings.json"), encoding="utf-8") as f:
+            configured = json.load(f).get("sessionDir")
+        if isinstance(configured, str) and os.path.isabs(os.path.expanduser(configured)):
+            return os.path.expanduser(configured)
+    except (OSError, ValueError, AttributeError, RecursionError):
+        pass
+    return os.path.join(PI_HOME, "sessions")
+
+
+PI_SESSIONS = pi_sessions()
 STATE = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local", "state"), "agents")
 
 AGENTS = ("claude", "codex", "pi")
@@ -111,7 +127,7 @@ INJECTED = (
     "<command-name", "<command-message", "<command-args", "<local-command-", "<task-notification",
     "<system-reminder", "<user-prompt-submit-hook", "<ide_selection", "<ide_opened_file", "<bash-input",
     "<bash-stdout", "<bash-stderr", "<environment_context", "<user_instructions", "<turn_aborted",
-    "<image", "</", "<INSTRUCTIONS>", "# AGENTS.md instructions", "[Request interrupted",
+    "<image name=", "</image>", "<INSTRUCTIONS>", "# AGENTS.md instructions", "[Request interrupted",
 )
 
 
@@ -179,14 +195,16 @@ def jsonl_files(root, accept=lambda name: name.endswith(".jsonl")):
 
 
 def text_field(value):
-    return value if isinstance(value, str) and value and "\t" not in value and "\n" not in value else None
+    """A string that can ride in one of fzf's tab-separated fields of a one-line row."""
+    return value if isinstance(value, str) and value and not any(c in value for c in "\t\n\r") else None
 
 
 # Claude Code: <claude home>/projects/<folder>/<session id>.jsonl
 
 def claude_said(d):
     m = d.get("message")
-    if d.get("type") not in ("user", "assistant") or d.get("isMeta") or d.get("isSidechain") or not isinstance(m, dict):
+    # isCompactSummary: the summary Claude writes when it compacts the conversation, not something said
+    if d.get("type") not in ("user", "assistant") or d.get("isMeta") or d.get("isSidechain") or d.get("isCompactSummary") or not isinstance(m, dict):
         return None, None
     return d["type"], blocks_text(m.get("content"))
 
@@ -223,14 +241,29 @@ def claude_command_start(buf):
     return " ".join([name, (match.group(2) or "").strip()]).strip()
 
 
+def claude_cwd(buf):
+    """The folder the conversation ran in, from the first line that names one (a broken line is passed over)."""
+    needle = style(buf, b'"cwd":"')
+    pos = 0
+    for _ in range(20):
+        at = buf.find(needle, pos) if needle else -1
+        if at < 0:
+            return None
+        start, end = line_bounds(buf, at)
+        pos = end + 1
+        d = parse(buf[start:end])
+        cwd = text_field(d.get("cwd")) if d else None
+        if cwd:
+            return cwd
+    return None
+
+
 def claude_conversation(path, name):
     buf = mapped(path)
     if buf is None:
         return None
     with buf:
-        needle = style(buf, b'"cwd":"')
-        meta = line_at(buf, buf.find(needle)) if needle else None
-        cwd = text_field(meta.get("cwd")) if meta else None
+        cwd = claude_cwd(buf)
         if not cwd:
             return None
         prompt = first_typed(buf, b'"type":"user"', claude_said) or claude_command_start(buf)
@@ -379,7 +412,7 @@ def conversations(mode="all"):
         if mode in ("all", agent):
             rows += READERS[agent]()
     # a file path with a tab or newline cannot ride in fzf's fields; such a conversation is left out
-    rows = [r for r in rows if "\t" not in r["path"] and "\n" not in r["path"]]
+    rows = [r for r in rows if text_field(r["path"])]
     # `agents .`: this folder and below (the folder travels to fzf's reloads in the environment)
     here = os.environ.get("AGENTS_HERE")
     if here:
@@ -471,7 +504,7 @@ def runs(argv, agent):
 
 # The id that resumes a conversation follows these words. A fork names its source too, but holds
 # only the new conversation, so `codex fork <id>` and `pi --fork <id>` hold nothing listed.
-OPENERS = {"codex": ("resume",), "pi": ("--session",)}
+OPENERS = {"codex": ("resume",), "pi": ("--session", "--session-id")}
 
 
 def held_by_command_line(rows, agent, procs):
@@ -484,7 +517,10 @@ def held_by_command_line(rows, agent, procs):
             if before in OPENERS[agent] and word in ids:
                 held.add(word)
         if agent == "pi":
-            held.update(a[len("--session="):] for a in argv if a.startswith("--session=") and a[len("--session="):] in ids)
+            for a in argv:
+                flag, _, value = a.partition("=")
+                if flag in OPENERS["pi"] and value in ids:
+                    held.add(value)
     return held
 
 
@@ -623,9 +659,9 @@ def remember(mode):
 
 def remembered():
     try:
-        with open(os.path.join(STATE, "mode")) as f:
+        with open(os.path.join(STATE, "mode"), encoding="utf-8") as f:
             mode = f.read().strip()
-    except OSError:
+    except (OSError, ValueError):
         return "all"
     return mode if mode in MODES and (mode == "all" or present(mode)) else "all"
 
@@ -714,7 +750,10 @@ def run(agent, cwd, argv):
         return
     # `agents .`'s folder was for this list only, not for what the agent starts
     os.environ.pop("AGENTS_HERE", None)
-    os.chdir(cwd)
+    try:
+        os.chdir(cwd)
+    except OSError as e:
+        sys.exit(f"进不去这个目录：{cwd}（{e.strerror}）")
     os.execvp(argv[0], argv)
 
 
@@ -761,7 +800,7 @@ def choose_dir(agent):
         start = []
     seen, dirs = set(), []
     for d in start + [r["cwd"] for r in conversations("all")] + [HOME]:
-        if d not in seen and "\t" not in d and "\n" not in d and os.path.isdir(d):
+        if d not in seen and text_field(d) and os.path.isdir(d):
             seen.add(d)
             dirs.append(d)
     lines = ["\t".join([d, "", "", "", "", short(d)]) for d in dirs]
@@ -771,13 +810,16 @@ def choose_dir(agent):
         return None
     out = res.stdout.split("\n")
     query = out[0].strip() if out else ""
-    # a typed path wins over a row that merely matches it fuzzily
+    chosen = out[1].split("\t")[0] if len(out) > 1 and out[1] else ""
+    # a typed path that exists wins over a row that merely matches it fuzzily; a path being typed
+    # that is no folder (yet) is a filter: the row it picked is the answer
     if query.startswith(("/", "~", "./", "../")):
-        typed_dir = os.path.abspath(os.path.expanduser(query))
+        target = os.path.expanduser(query)
+        typed_dir = os.path.normpath(target if os.path.isabs(target) else os.path.join(here(), target))
         if os.path.isdir(typed_dir):
             return typed_dir
-        sys.exit(f"没有这个目录：{typed_dir}")
-    chosen = out[1].split("\t")[0] if len(out) > 1 and out[1] else ""
+        if not chosen:
+            sys.exit(f"没有这个目录：{typed_dir}")
     return chosen or None
 
 
@@ -830,11 +872,15 @@ def main(argv):
         else:
             last = remembered()
             agent = last if last in AGENTS and installed(last) else next((a for a in AGENTS if installed(a)), "claude")
+        if len(rest) > 1:
+            sys.exit("用法：agents new [claude|codex|pi] [目录] [-- 给 agent 的参数]")
         cwd = None
         if rest:
             target = os.path.expanduser(rest[0])
-            cwd = target if os.path.isabs(target) else os.path.join(here(), target)
-            cwd = os.path.normpath(cwd)
+            cwd = os.path.normpath(target if os.path.isabs(target) else os.path.join(here(), target))
+            if not os.path.isdir(cwd):
+                hint = "" if "/" in rest[0] else "（agent 可以是 claude、codex、pi）"
+                sys.exit(f"没有这个目录：{cwd}{hint}")
         return new(agent, cwd, extra)
 
     mode = None

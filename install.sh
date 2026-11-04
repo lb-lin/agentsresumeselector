@@ -22,7 +22,7 @@ if command -v curl >/dev/null 2>&1; then
 elif command -v wget >/dev/null 2>&1; then
   fetch() { wget -qO "$2" "$1"; }
   # the last redirect's target; BusyBox wget has no --max-redirect, GNU wget adds " [following]"
-  final_url() { wget -S --spider "$1" 2>&1 | sed -n 's/^ *Location: \([^ ]*\).*/\1/p' | tail -n 1 | tr -d '\r'; }
+  final_url() { wget -S --spider "$1" 2>&1 | sed -n 's/^ *[Ll]ocation: *\([^ ]*\).*$/\1/p' | tail -n 1 | tr -d '\r'; }
 else
   die "curl or wget is needed"
 fi
@@ -30,6 +30,7 @@ fi
 sha256() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
   elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | cut -d' ' -f1
+  elif command -v sha256 >/dev/null 2>&1; then sha256 -q "$1"
   else echo ""; fi
 }
 
@@ -84,7 +85,7 @@ if [ "$need_fzf" = "1" ]; then
   case "$(uname -m)" in
     x86_64|amd64) arch=amd64 ;;
     aarch64|arm64) arch=arm64 ;;
-    armv7*) arch=armv7 ;;
+    armv7*|armv8l) arch=armv7 ;;
     armv6*) arch=armv6 ;;
     armv5*) arch=armv5 ;;
     riscv64|ppc64le|s390x) arch="$(uname -m)" ;;
@@ -104,7 +105,8 @@ if [ "$need_fzf" = "1" ]; then
   [ -n "$expected" ] || die "fzf's checksum list has no $asset"
   [ -n "$actual" ] || die "sha256sum or shasum is needed to check fzf"
   [ "$expected" = "$actual" ] || die "fzf checksum mismatch"
-  tar -xzf "$tmp/$asset" -C "$tmp" fzf
+  # -o: the files belong to whoever installs, not to the uid inside the archive (matters as root)
+  tar -xzof "$tmp/$asset" -C "$tmp" fzf
   mv "$tmp/fzf" "$BIN/fzf"
   chmod 755 "$BIN/fzf"
   say "    $BIN/fzf (checksum ok)"

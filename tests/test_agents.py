@@ -240,6 +240,35 @@ class Reading(Base):
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertIn(b"broken", res.stdout)
 
+    def test_more_titles_and_prompts(self):
+        self.add("claude", "named1", os.path.join(self.claude_projects, "-work", "named1.jsonl"), [
+            user(self.work, "hello"), {"type": "agent-name", "agentName": "后台任务"},
+        ])
+        self.add("claude", "tag2", os.path.join(self.claude_projects, "-work", "tag2.jsonl"), [user(self.work, "<image> tag has no alt")])
+        self.add("claude", "compact1", os.path.join(self.claude_projects, "-work", "compact1.jsonl"), [
+            user(self.work, "This session is being continued from a previous conversation", isCompactSummary=True),
+        ])
+        self.add("claude", "cwd2", os.path.join(self.claude_projects, "-work", "cwd2.jsonl"), [
+            '{"type":"x","cwd":"/tmp", TRUNCATED', user(self.work, "after a broken line"),
+        ], compact=True)
+        self.add("claude", "cr1", os.path.join(self.claude_projects, "-work", "cr1.jsonl"), [user(self.work + "\rb", "carriage return folder")])
+        titles = self.titles()
+        self.assertEqual(titles["named1"], "后台任务")
+        self.assertEqual(titles["tag2"], "<image> tag has no alt")
+        self.assertNotIn("compact1", titles)  # a compaction summary is nothing the person said
+        self.assertEqual(titles["cwd2"], "after a broken line")
+        self.assertNotIn("cr1", titles)
+
+    def test_pi_session_folder_settings(self):
+        elsewhere = os.path.join(self.tmp.name, "pi-elsewhere")
+        shutil.move(os.path.join(self.pi, "sessions"), elsewhere)
+        with open(os.path.join(self.pi, "settings.json"), "w") as f:
+            json.dump({"sessionDir": elsewhere}, f)
+        self.assertEqual(load(self.env).PI_SESSIONS, elsewhere)
+        self.assertIn("hhhh8888", [r["id"] for r in load(self.env).conversations("pi")])
+        other = os.path.join(self.tmp.name, "pi-env")
+        self.assertEqual(load({**self.env, "PI_CODING_AGENT_SESSION_DIR": other}).PI_SESSIONS, other)
+
     def test_this_folder_and_below_only(self):
         with mock.patch.dict(os.environ, {"AGENTS_HERE": self.game}):
             cwds = {r["cwd"] for r in self.cr.conversations()}
@@ -293,6 +322,7 @@ class Held(Base):
         self.assertEqual(self.cr.held_by_command_line(rows, "pi", procs), {"hhhh8888"})
         self.assertEqual(self.cr.held_by_command_line(rows, "pi", [["node", "/x/pi-coding-agent/dist/cli.js", "--fork", "hhhh8888"]]), set())
         self.assertEqual(self.cr.held_by_command_line(rows, "pi", [["pi", "--session=hhhh8888"]]), {"hhhh8888"})
+        self.assertEqual(self.cr.held_by_command_line(rows, "pi", [["pi", "--session-id", "hhhh8888"]]), {"hhhh8888"})
 
 
 class Lists(Base):
@@ -474,6 +504,51 @@ class Commands(Base):
         res, _ = self.run_agents("update")
         self.assertNotEqual(res.returncode, 0)
         self.assertIn("更新失败", res.stderr)
+
+    def test_reopens_the_last_list(self):
+        os.makedirs(os.path.join(self.env["XDG_STATE_HOME"], "agents"))
+        with open(os.path.join(self.env["XDG_STATE_HOME"], "agents", "mode"), "w") as f:
+            f.write("codex")
+        self.run_agents()
+        args = self.fzf_calls()[-1]
+        self.assertEqual(args[args.index("--prompt") + 1], "Codex > ")
+        with open(os.path.join(self.env["XDG_STATE_HOME"], "agents", "mode"), "wb") as f:
+            f.write(b"\xff")  # a damaged state file falls back to the mixed list
+        self.run_agents()
+        args = self.fzf_calls()[-1]
+        self.assertEqual(args[args.index("--prompt") + 1], "全部 > ")
+
+    def test_the_agent_really_starts_in_the_conversations_folder(self):
+        claude = os.path.join(self.bin, "claude")
+        with open(claude, "w") as f:
+            f.write('#!/bin/sh\necho "pwd=$(pwd) args=$*"\n')
+        os.chmod(claude, 0o755)
+        env = {**os.environ, **self.env, "PATH": self.bin + os.pathsep + os.environ.get("PATH", ""),
+               "FAKE_FZF_LOG": self.log, "FAKE_FZF_PICK": "\tbbbb\t", "FAKE_FZF_KEY": ""}
+        res = subprocess.run([sys.executable, "-I", SCRIPT, "--all"], capture_output=True, text=True, env=env, cwd=self.work)
+        self.assertEqual(res.stdout.strip(), f"pwd={self.game} args=--resume bbbb")
+
+    def test_new_with_a_wrong_folder_or_argument(self):
+        res, launched = self.run_agents("new", "cladue")
+        self.assertIsNone(launched)
+        self.assertIn("claude、codex、pi", res.stderr)
+        res, launched = self.run_agents("new", self.game, "codex")
+        self.assertIsNone(launched)
+        self.assertIn("用法", res.stderr)
+
+    def test_a_folder_it_cannot_enter(self):
+        if os.geteuid() == 0:
+            self.skipTest("root enters any folder")
+        locked = os.path.join(self.tmp.name, "locked")
+        os.makedirs(locked)
+        os.chmod(locked, 0)
+        try:
+            env = {**os.environ, **self.env, "PATH": self.bin + os.pathsep + os.environ.get("PATH", "")}
+            res = subprocess.run([sys.executable, "-I", SCRIPT, "new", "claude", locked], capture_output=True, text=True, env=env, cwd=self.work)
+        finally:
+            os.chmod(locked, 0o755)
+        self.assertNotIn("Traceback", res.stderr)
+        self.assertNotEqual(res.returncode, 0)
 
     def test_version(self):
         res, _ = self.run_agents("--version")

@@ -47,7 +47,7 @@ curl -fsSL https://raw.githubusercontent.com/lb-lin/agentsresumeselector/main/in
 | Ctrl-T | 在 全部 / Claude / Codex / Pi 之间切换 |
 | Ctrl-/ | 显示或隐藏预览（最近几轮对话） |
 
-- 标题依次取：你起的名字（Claude 的 `/rename`、Codex 的线程名、Pi 的 `/name`），Claude 自动生成的标题或 `claude agents` 里的会话名，你说的第一句话。第一句话也能被搜到；以斜杠命令开头、之后得到过回复的对话，用那条命令当标题。
+- 标题依次取：你起的名字（Claude 的 `/rename`、Codex 的线程名、Pi 的 `/name`），Claude 自动生成的标题或 `claude agents` 里的会话名，你说的第一句话。第一句话的前 300 个字也能被搜到；以斜杠命令开头、之后得到过回复的对话，用那条命令当标题。
 - 还没说过话的空对话、只执行过一条设置命令的对话、Claude 和 Codex 内部的子 agent 不会列出。一份记录坏了只会跳过它自己，不影响列表。
 - **●** 表示这个对话正被一个运行中的 agent 占着，这时不能恢复，但可以按 Ctrl-O 分出一份。Claude 看 `~/.claude/sessions` 里的进程记录；Codex 在 Linux 上看它的线程写锁，macOS 上只能认出用 `codex resume <id>` 打开的；Pi 只能认出用 `pi --session <id>` 打开的。
 
@@ -57,7 +57,7 @@ curl -fsSL https://raw.githubusercontent.com/lb-lin/agentsresumeselector/main/in
 
 - Claude Code：`~/.claude/projects/*/*.jsonl`（或 `$CLAUDE_CONFIG_DIR`），`~/.claude/sessions/*.json`
 - Codex：`~/.codex/sessions/**/rollout-*.jsonl`、`~/.codex/session_index.jsonl`（或 `$CODEX_HOME`），`~/.codex/thread-writer-locks/`
-- Pi：`~/.pi/agent/sessions/**/*.jsonl`（或 `$PI_CODING_AGENT_DIR`、`$PI_CODING_AGENT_SESSION_DIR`）
+- Pi：`~/.pi/agent/sessions/**/*.jsonl`（或 `$PI_CODING_AGENT_SESSION_DIR`、`$PI_CODING_AGENT_DIR`，以及 Pi 的 `settings.json` 里写成绝对路径的 `sessionDir`；单次运行时用的 `--session-dir` 没法知道）
 - 判断「正被占用」时：正在运行的进程的命令行，Linux 上还有 `/proc/locks`
 
 唯一会写的：`~/.local/state/agents/mode`（或 `$XDG_STATE_HOME/agents/mode`），记住你上次看的是哪个列表。
