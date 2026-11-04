@@ -12,7 +12,8 @@
 https://github.com/lb-lin/agentsresumeselector
 
 In the list: the switcher under the input shows which list you are on (all / Claude / Codex /
-Pi); → (or Tab) moves to the next, ← (or Shift-Tab) back; Ctrl-B / Ctrl-F move in the search text. Enter resumes in the conversation's own folder,
+Pi). With nothing typed, → moves to the next list and ← back; once you type, ←/→ move in the search
+text again. Tab / Shift-Tab switch lists either way. Enter resumes in the conversation's own folder,
 Ctrl-O forks it (a copy to go on from, the original stays as it was), Ctrl-N starts a new one
 with the same agent in that folder. When the agent exits you are back where you were.
 ● marks a conversation a running agent holds: it can be forked, not resumed.
@@ -28,7 +29,7 @@ import sys
 import time
 import unicodedata
 
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 REPO = "lb-lin/agentsresumeselector"
 HOME = os.path.expanduser("~")
 CLAUDE_HOME = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude")
@@ -60,6 +61,7 @@ DIM, RESET = "\033[2m", "\033[0m"
 MODES = ("all",) + AGENTS
 LABELS = {"all": "全部", "claude": "Claude", "codex": "Codex", "pi": "Pi"}
 FZF_SWITCH = (0, 46)  # the transform action, which switching lists needs
+FZF_WITH_SHELL = (0, 51)  # --with-shell: the arrows' check runs in sh, whatever $SHELL is
 FZF_FOOTER = (0, 65)  # --footer: key help under the list, the switcher alone above it
 NEED_FZF = "需要 fzf：重新运行安装命令，或从 https://github.com/junegunn/fzf 安装"
 BROKEN = (ValueError, TypeError, AttributeError, KeyError, IndexError, RecursionError)
@@ -672,7 +674,8 @@ def lists():
     return ["all"] + [a for a in AGENTS if present(a)]
 
 
-KEYS_HELP = "←/→ 切换列表 · Enter 恢复 · Ctrl-O 分支 · Ctrl-N 同目录新建 · Ctrl-/ 预览 · ● 正被占用"
+SWITCH_HELP = "←/→ 切换列表（打字时移动光标）· Tab 随时切换 · "
+KEYS_HELP = SWITCH_HELP + "Enter 恢复 · Ctrl-O 分支 · Ctrl-N 同目录新建 · Ctrl-/ 预览 · ● 正被占用"
 
 
 def switcher(mode):
@@ -692,8 +695,11 @@ def header(mode, footer):
     return switcher(mode) if footer else f"{switcher(mode)}   {DIM}{KEYS_HELP}{RESET}"
 
 
-def cycle(step=1, footer=True):
-    """→ / ←: the next (or previous) list, skipping absent agents. The list shown is the remembered one."""
+def cycle(step=1, footer=True, arrow=False):
+    """→ / ← (or Tab / Shift-Tab): the next (or previous) list, skipping absent agents. The list shown is
+    the remembered one. An arrow with text typed moves in the search text instead."""
+    if arrow and os.environ.get("FZF_QUERY"):
+        return "forward-char" if step > 0 else "backward-char"
     order = lists()
     now = remembered()
     nxt = order[(order.index(now) + step) % len(order)] if now in order else "all"
@@ -881,8 +887,8 @@ def main(argv):
             print("\n".join(lines))
         return
     if argv[:1] == ["--cycle"]:
-        # --cycle [next|back] [footer|inline]
-        print(cycle(-1 if "back" in argv[1:] else 1, "inline" not in argv[1:]))
+        # --cycle [next|back] [footer|inline] [arrow]
+        print(cycle(-1 if "back" in argv[1:] else 1, "inline" not in argv[1:], "arrow" in argv[1:]))
         return
     if argv[:1] == ["--preview"]:
         preview(*argv[1:5])
@@ -929,12 +935,19 @@ def main(argv):
     layout = "footer" if footer else "inline"
     if version >= FZF_SWITCH:
         forward, back = f"transform:{me()} --cycle next {layout}", f"transform:{me()} --cycle back {layout}"
-        # ←/→ switch lists (the search text keeps Ctrl-B / Ctrl-F to move in it); Tab / Shift-Tab too
-        keys += ["--bind", f"right:{forward}", "--bind", f"left:{back}", "--bind", f"tab:{forward}",
+        # ←/→ switch lists while nothing is typed, and move in the search text once something is.
+        # The check runs in sh, so typing with the arrows starts no Python (fzf 0.51+: --with-shell).
+        if version >= FZF_WITH_SHELL:
+            keys += ["--with-shell", "sh -c"]
+            right = f'transform:[ -n "$FZF_QUERY" ] && echo forward-char || {me()} --cycle next {layout}'
+            left = f'transform:[ -n "$FZF_QUERY" ] && echo backward-char || {me()} --cycle back {layout}'
+        else:
+            right, left = forward + " arrow", back + " arrow"
+        keys += ["--bind", f"right:{right}", "--bind", f"left:{left}", "--bind", f"tab:{forward}",
                  "--bind", f"btab:{back}", "--bind", f"ctrl-t:{forward}"]
         top = header(mode, footer)
     else:
-        top = f"{DIM}{KEYS_HELP.replace('←/→ 切换列表 · ', '')}{RESET}  （fzf 0.46 以上才能切换列表：运行 agents update）"
+        top = f"{DIM}{KEYS_HELP.replace(SWITCH_HELP, '')}{RESET}  （fzf 0.46 以上才能切换列表：运行 agents update）"
     if footer:
         keys += ["--footer", f"{DIM}{KEYS_HELP}{RESET}"]
     res = pick(rows_for(mode), "> ", " ".join(words), top, keys)

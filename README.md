@@ -13,10 +13,10 @@
   5分钟前  [Claude] ~/livegame           互动游戏
   1天前    [Codex]  ~/dshlive            继续完成打工经济玩法任务
   1天前    [Claude] ~/livegame           更合适的弹珠游戏 · 我们现在有更合适的弹珠游戏吗
- ←/→ 切换列表 · Enter 恢复 · Ctrl-O 分支 · Ctrl-N 同目录新建 · Ctrl-/ 预览 · ● 正被占用
+ ←/→ 切换列表（打字时移动光标）· Tab 随时切换 · Enter 恢复 · Ctrl-O 分支 · Ctrl-N 同目录新建 · Ctrl-/ 预览 · ● 正被占用
 ```
 
-输入框下面是切换器：全部、Claude、Codex、Pi，当前的那个用它的颜色高亮。按 **→** 切到下一个，**←** 切回上一个（Tab / Shift-Tab 也行）。左右键用来切换列表后，在搜索框里移动光标用 Ctrl-B / Ctrl-F。「全部」里每一行都标着是哪个 agent。下次打开时停在你上次看的那个列表。机器上既没装、也没有留下对话的 agent 不出现在切换器里。
+输入框下面是切换器：全部、Claude、Codex、Pi，当前的那个用它的颜色高亮。搜索框是空的时候，按 **→** 切到下一个，**←** 切回上一个；一旦输入了字，←/→ 就照常在搜索框里移动光标。**Tab / Shift-Tab** 不管有没有输入都能切换（Ctrl-T 同 Tab）。「全部」里每一行都标着是哪个 agent。下次打开时停在你上次看的那个列表。机器上既没装、也没有留下对话的 agent 不出现在切换器里。
 
 ## 安装
 
@@ -45,8 +45,8 @@ curl -fsSL https://raw.githubusercontent.com/lb-lin/agentsresumeselector/main/in
 | Enter | 在对话原来的目录里恢复（`claude --resume <id>` / `codex resume <id>` / `pi --session <id>`） |
 | Ctrl-O | 分支：从这个对话复制出一份新的接着聊，原对话不动（`claude --resume <id> --fork-session` / `codex fork <id>` / `pi --fork <id>`） |
 | Ctrl-N | 用同一个 agent 在同一个目录新开一个对话 |
-| ← / → | 在 全部 / Claude / Codex / Pi 之间切换（Tab / Shift-Tab、Ctrl-T 也行） |
-| Ctrl-B / Ctrl-F | 在搜索框里左右移动光标 |
+| ← / → | 搜索框为空时：在 全部 / Claude / Codex / Pi 之间切换；输入了字时：移动光标 |
+| Tab / Shift-Tab | 随时切换列表（Ctrl-T 同 Tab） |
 | Ctrl-/ | 显示或隐藏预览（最近几轮对话） |
 
 - 标题依次取：你起的名字（Claude 的 `/rename`、Codex 的线程名、Pi 的 `/name`），Claude 自动生成的标题或 `claude agents` 里的会话名，你说的第一句话。第一句话的前 300 个字也能被搜到；以斜杠命令开头、之后得到过回复的对话，用那条命令当标题。

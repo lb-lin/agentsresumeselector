@@ -344,6 +344,14 @@ class Lists(Base):
         self.assertIn("切换列表", self.cr.header("all", footer=False))  # no footer: key help rides along
         self.assertNotIn("切换列表", self.cr.header("all", footer=True))
 
+    def test_an_arrow_moves_in_typed_text(self):
+        with mock.patch.dict(os.environ, {"FZF_QUERY": "login"}):
+            self.assertEqual(self.cr.cycle(1, arrow=True), "forward-char")
+            self.assertEqual(self.cr.cycle(-1, arrow=True), "backward-char")
+            self.assertIn("--list claude", self.cr.cycle(1))  # Tab switches whatever is typed
+        with mock.patch.dict(os.environ, {"FZF_QUERY": ""}):
+            self.assertIn("--list codex", self.cr.cycle(1, arrow=True))
+
     def test_cycle_skips_an_agent_with_nothing_here(self):
         shutil.rmtree(self.pi)
         self.cr.remember("codex")
@@ -484,8 +492,11 @@ class Commands(Base):
         self.assertIn("ctrl-n,ctrl-o", args)
         self.assertTrue(any(a.startswith("tab:transform:") and a.endswith("--cycle next footer") for a in args))
         self.assertTrue(any(a.startswith("btab:transform:") and a.endswith("--cycle back footer") for a in args))
-        self.assertTrue(any(a.startswith("right:transform:") and a.endswith("--cycle next footer") for a in args))
-        self.assertTrue(any(a.startswith("left:transform:") and a.endswith("--cycle back footer") for a in args))
+        right = next(a for a in args if a.startswith("right:transform:"))
+        self.assertIn('[ -n "$FZF_QUERY" ] && echo forward-char', right)  # typing: the arrow moves in the text
+        self.assertTrue(right.endswith("--cycle next footer"))
+        self.assertTrue(next(a for a in args if a.startswith("left:transform:")).endswith("--cycle back footer"))
+        self.assertEqual(args[args.index("--with-shell") + 1], "sh -c")
         self.assertEqual(args[args.index("--query") + 1], "notes")
         bar = args[args.index("--header") + 1]
         self.assertIn("\033[1;7m Codex ", bar)
