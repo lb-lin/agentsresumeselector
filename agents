@@ -1,0 +1,884 @@
+#!/usr/bin/env python3
+"""agents: pick a Claude Code, Codex or Pi conversation, from any folder, and resume it there.
+
+  agents                          the list you looked at last (all agents at first)
+  agents --all | --claude | --codex | --pi   start on that list (Ctrl-T switches in the list)
+  agents <words>                  start with that filter
+  agents .                        only conversations in this folder (and below)
+  agents new [claude|codex|pi] [dir]   a new conversation (no dir: pick one)
+  agents update                   install the newest version
+  agents ... -- <args>            anything after `--` goes to the agent
+
+https://github.com/lb-lin/agentsresumeselector
+
+In the list: Enter resumes in the conversation's own folder, Ctrl-O forks it (a copy to go on
+from, the original stays as it was), Ctrl-N starts a new one with the same agent in that folder,
+Ctrl-T switches between all / Claude / Codex / Pi. When the agent exits you are back where you
+were. ● marks a conversation a running agent holds: it can be forked, not resumed.
+"""
+import json
+import mmap
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+import unicodedata
+
+VERSION = "0.4.0"
+REPO = "lb-lin/agentsresumeselector"
+HOME = os.path.expanduser("~")
+CLAUDE_HOME = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude")
+CODEX_HOME = os.environ.get("CODEX_HOME") or os.path.join(HOME, ".codex")
+PI_SESSIONS = os.environ.get("PI_CODING_AGENT_SESSION_DIR") or os.path.join(
+    os.environ.get("PI_CODING_AGENT_DIR") or os.path.join(HOME, ".pi", "agent"), "sessions")
+STATE = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local", "state"), "agents")
+
+AGENTS = ("claude", "codex", "pi")
+NAMES = {"claude": "Claude", "codex": "Codex", "pi": "Pi"}
+COLORS = {"claude": "\033[38;5;173m", "codex": "\033[38;5;75m", "pi": "\033[38;5;114m"}
+DIM, RESET = "\033[2m", "\033[0m"
+MODES = ("all",) + AGENTS
+PROMPTS = {"all": "全部 > ", "claude": "Claude > ", "codex": "Codex > ", "pi": "Pi > "}
+FZF_MIN = (0, 46)  # transform and $FZF_PROMPT
+NEED_FZF = "需要 fzf：重新运行安装命令，或从 https://github.com/junegunn/fzf 安装"
+BROKEN = (ValueError, TypeError, AttributeError, KeyError, IndexError, RecursionError)
+
+
+def fzf_bin():
+    """The fzf installed beside this script (the installer's, maybe newer than one on PATH), else PATH's."""
+    beside = os.path.join(os.path.dirname(os.path.realpath(__file__)), "fzf")
+    return beside if os.access(beside, os.X_OK) else "fzf"
+
+
+def session_roots():
+    return {"claude": os.path.join(CLAUDE_HOME, "projects"), "codex": os.path.join(CODEX_HOME, "sessions"), "pi": PI_SESSIONS}
+
+
+# ---------- reading the transcripts ----------
+
+def spaced(needle):
+    """The same key/value written with a space after the colon (json.dumps' default style)."""
+    return needle.replace(b'":"', b'": "').replace(b'":{', b'": {')
+
+
+def style(buf, needle):
+    """The needle as this file writes it (compact or spaced); None when it holds neither."""
+    if buf.find(needle) >= 0:
+        return needle
+    other = spaced(needle)
+    return other if other != needle and buf.find(other) >= 0 else None
+
+
+def parse(raw):
+    """A JSON object from bytes; None for anything else, broken or too deep."""
+    try:
+        d = json.loads(raw)
+    except (ValueError, RecursionError):
+        return None
+    return d if isinstance(d, dict) else None
+
+
+def line_bounds(buf, at):
+    start = buf.rfind(b"\n", 0, at) + 1
+    end = buf.find(b"\n", at)
+    return start, (end if end >= 0 else len(buf))
+
+
+def line_at(buf, at):
+    start, end = line_bounds(buf, at)
+    return parse(buf[start:end])
+
+
+def first_line(buf):
+    return line_at(buf, 0)
+
+
+def last_of(buf, needle, field):
+    needle = style(buf, needle)
+    if needle is None:
+        return None
+    d = line_at(buf, buf.rfind(needle))
+    value = d.get(field) if d else None
+    return value if isinstance(value, str) and value.strip() else None
+
+
+# What agents put into the person's turn that the person did not type: command echoes, system
+# notes, injected context, image markers. A prompt starting with any other "<" is the person's.
+INJECTED = (
+    "<command-name", "<command-message", "<command-args", "<local-command-", "<task-notification",
+    "<system-reminder", "<user-prompt-submit-hook", "<ide_selection", "<ide_opened_file", "<bash-input",
+    "<bash-stdout", "<bash-stderr", "<environment_context", "<user_instructions", "<turn_aborted",
+    "<image", "</", "<INSTRUCTIONS>", "# AGENTS.md instructions", "[Request interrupted",
+)
+
+
+def typed(text):
+    """Text a person typed, not a command echo, a system note or injected context."""
+    if not isinstance(text, str) or not text.strip():
+        return False
+    return not text.lstrip().startswith(INJECTED)
+
+
+def blocks_text(content):
+    """What a message says: a string, or the first typed text among its {type: text} blocks."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return None
+    texts = [p.get("text") for p in content
+             if isinstance(p, dict) and p.get("type") in ("text", "input_text", "output_text") and isinstance(p.get("text"), str)]
+    return next((t for t in texts if typed(t)), texts[0] if texts else None)
+
+
+def first_typed(buf, needle, said, limit=300):
+    """The first thing the person typed: the first `needle` line whose text `said` returns as typed.
+
+    Tool results ride on the person's turn too (Claude); they are skipped unread and not counted.
+    """
+    needle = style(buf, needle)
+    if needle is None:
+        return None
+    pos, looked = 0, 0
+    while looked < limit:
+        at = buf.find(needle, pos)
+        if at < 0:
+            return None
+        start, end = line_bounds(buf, at)
+        pos = end + 1
+        line = buf[start:end]
+        if b'"tool_result"' in line:
+            continue
+        looked += 1
+        d = parse(line)
+        if d:
+            who, text = said(d)
+            if who == "user" and typed(text):
+                return text
+    return None
+
+
+def mapped(path):
+    """The file as bytes without reading it all in (mmap); None when empty or unreadable."""
+    try:
+        with open(path, "rb") as f:
+            if os.fstat(f.fileno()).st_size == 0:
+                return None
+            return mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+    except (OSError, ValueError):
+        return None
+
+
+def jsonl_files(root, accept=lambda name: name.endswith(".jsonl")):
+    for folder, _, files in os.walk(root):
+        for name in files:
+            if accept(name):
+                yield os.path.join(folder, name), name
+
+
+def text_field(value):
+    return value if isinstance(value, str) and value and "\t" not in value and "\n" not in value else None
+
+
+# Claude Code: <claude home>/projects/<folder>/<session id>.jsonl
+
+def claude_said(d):
+    m = d.get("message")
+    if d.get("type") not in ("user", "assistant") or d.get("isMeta") or d.get("isSidechain") or not isinstance(m, dict):
+        return None, None
+    return d["type"], blocks_text(m.get("content"))
+
+
+COMMAND_RE = re.compile(r"<command-name>\s*(/?[^<\s]+)\s*</command-name>(?:.*?<command-args>(.*?)</command-args>)?", re.S)
+
+
+def claude_command_start(buf):
+    """A conversation started with a slash command and answered: named by that command."""
+    needle = style(buf, b'"type":"assistant"')
+    if needle is None:
+        return None
+    pos, answered = 0, False
+    for _ in range(50):
+        at = buf.find(needle, pos)
+        if at < 0:
+            break
+        start, end = line_bounds(buf, at)
+        pos = end + 1
+        d = parse(buf[start:end])
+        m = d.get("message") if d else None
+        if isinstance(m, dict) and m.get("model") != "<synthetic>":
+            answered = True
+            break
+    if not answered:
+        return None
+    at = buf.find(b"<command-name>")
+    d = line_at(buf, at) if at >= 0 else None
+    text = blocks_text((d.get("message") or {}).get("content")) if d and isinstance(d.get("message"), dict) else None
+    match = COMMAND_RE.search(text) if isinstance(text, str) else None
+    if not match:
+        return None
+    name = match.group(1) if match.group(1).startswith("/") else "/" + match.group(1)
+    return " ".join([name, (match.group(2) or "").strip()]).strip()
+
+
+def claude_conversation(path, name):
+    buf = mapped(path)
+    if buf is None:
+        return None
+    with buf:
+        needle = style(buf, b'"cwd":"')
+        meta = line_at(buf, buf.find(needle)) if needle else None
+        cwd = text_field(meta.get("cwd")) if meta else None
+        if not cwd:
+            return None
+        prompt = first_typed(buf, b'"type":"user"', claude_said) or claude_command_start(buf)
+        if not prompt:
+            return None
+        title = (last_of(buf, b'"type":"custom-title"', "customTitle")
+                 or last_of(buf, b'"type":"ai-title"', "aiTitle")
+                 or last_of(buf, b'"type":"agent-name"', "agentName")
+                 or prompt)
+    return conversation("claude", name[:-6], cwd, title, path, prompt)
+
+
+def claude_conversations():
+    out = []
+    root = os.path.join(CLAUDE_HOME, "projects")
+    for path, name in jsonl_files(root):
+        # subagent transcripts live in <session>/subagents/; only the top level is a conversation
+        if os.path.dirname(os.path.dirname(path)) != root:
+            continue
+        try:
+            row = claude_conversation(path, name)
+        except BROKEN:
+            continue
+        if row:
+            out.append(row)
+    return out
+
+
+# Codex: <codex home>/sessions/YYYY/MM/DD/rollout-<time>-<thread id>.jsonl, names in session_index.jsonl
+
+def codex_names():
+    """Thread names Codex keeps in session_index.jsonl (later lines win)."""
+    names = {}
+    try:
+        with open(os.path.join(CODEX_HOME, "session_index.jsonl"), encoding="utf-8", errors="replace") as f:
+            for line in f:
+                d = parse(line)
+                if d and isinstance(d.get("id"), str) and isinstance(d.get("thread_name"), str) and d["thread_name"].strip():
+                    names[d["id"]] = d["thread_name"]
+    except OSError:
+        pass
+    return names
+
+
+def codex_said(d):
+    p = d.get("payload")
+    if d.get("type") != "response_item" or not isinstance(p, dict) or p.get("type") != "message" or p.get("role") not in ("user", "assistant"):
+        return None, None
+    return p["role"], blocks_text(p.get("content"))
+
+
+def codex_conversation(path, names):
+    buf = mapped(path)
+    if buf is None:
+        return None
+    with buf:
+        head = first_line(buf)
+        meta = head.get("payload") if head else None
+        if not isinstance(meta, dict):
+            return None
+        # Codex's own helpers (the guardian reviewer and other sub-agents) are no one's conversation
+        source = meta.get("source")
+        if isinstance(source, dict) and "subagent" in source:
+            return None
+        thread, cwd = text_field(meta.get("id")), text_field(meta.get("cwd"))
+        if not thread or not cwd:
+            return None
+        prompt = first_typed(buf, b'"role":"user"', codex_said)
+        if not prompt:
+            return None
+    return conversation("codex", thread, cwd, names.get(thread) or prompt, path, prompt)
+
+
+def codex_conversations():
+    out = []
+    names = codex_names()
+    for path, _ in jsonl_files(os.path.join(CODEX_HOME, "sessions"), lambda n: n.startswith("rollout-") and n.endswith(".jsonl")):
+        try:
+            row = codex_conversation(path, names)
+        except BROKEN:
+            continue
+        if row:
+            out.append(row)
+    return out
+
+
+# Pi: <pi agent dir>/sessions/--<folder>--/<time>_<session id>.jsonl, a {"type":"session"} header first
+
+def pi_said(d):
+    m = d.get("message")
+    if d.get("type") != "message" or not isinstance(m, dict) or m.get("role") not in ("user", "assistant"):
+        return None, None
+    return m["role"], blocks_text(m.get("content"))
+
+
+def pi_conversation(path):
+    buf = mapped(path)
+    if buf is None:
+        return None
+    with buf:
+        head = first_line(buf)
+        if not head or head.get("type") != "session":
+            return None
+        ident, cwd = text_field(head.get("id")), text_field(head.get("cwd"))
+        if not ident or not cwd:
+            return None
+        prompt = first_typed(buf, b'"role":"user"', pi_said)
+        if not prompt:
+            return None
+        title = last_of(buf, b'"type":"session_info"', "name") or prompt
+    return conversation("pi", ident, cwd, title, path, prompt)
+
+
+def pi_conversations():
+    out = []
+    for path, _ in jsonl_files(PI_SESSIONS):
+        try:
+            row = pi_conversation(path)
+        except BROKEN:
+            continue
+        if row:
+            out.append(row)
+    return out
+
+
+READERS = {"claude": claude_conversations, "codex": codex_conversations, "pi": pi_conversations}
+SAID = {"claude": claude_said, "codex": codex_said, "pi": pi_said}
+
+
+def clean(text):
+    """One line, no tabs: fzf's fields are tab-separated and a row is one line."""
+    return " ".join(str(text).split())
+
+
+def conversation(agent, ident, cwd, title, path, prompt):
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        mtime = 0
+    return {"agent": agent, "id": clean(ident), "cwd": cwd, "title": clean(title), "path": path, "mtime": mtime, "prompt": clean(prompt)}
+
+
+def conversations(mode="all"):
+    rows = []
+    for agent in AGENTS:
+        if mode in ("all", agent):
+            rows += READERS[agent]()
+    # a file path with a tab or newline cannot ride in fzf's fields; such a conversation is left out
+    rows = [r for r in rows if "\t" not in r["path"] and "\n" not in r["path"]]
+    # `agents .`: this folder and below (the folder travels to fzf's reloads in the environment)
+    here = os.environ.get("AGENTS_HERE")
+    if here:
+        rows = [r for r in rows if r["cwd"] == here or r["cwd"].startswith(here.rstrip("/") + "/")]
+    rows.sort(key=lambda c: c["mtime"], reverse=True)
+    return rows
+
+
+# ---------- what a running agent holds ----------
+
+def alive(pid, started=None):
+    """Whether pid runs, and, where its start time is known, is still the process that started then."""
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        pass
+    except (OSError, OverflowError, ValueError):
+        return False
+    if started is None:
+        return True
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            stat = f.read()
+        # the fields after the command name, which may hold spaces and parentheses; starttime is the 22nd
+        return stat[stat.rindex(")") + 2:].split()[19] == str(started)
+    except (OSError, ValueError, IndexError):
+        return True
+
+
+def held_claude():
+    held = set()
+    folder = os.path.join(CLAUDE_HOME, "sessions")
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return held
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(folder, name), "rb") as f:
+                record = parse(f.read())
+        except OSError:
+            continue
+        if not record:
+            continue
+        pid, session = record.get("pid"), record.get("sessionId")
+        started = record.get("procStart")
+        if isinstance(pid, int) and pid > 0 and isinstance(session, str) and alive(pid, started if isinstance(started, (str, int)) else None):
+            held.add(session)
+    return held
+
+
+def processes():
+    """The command lines of running processes."""
+    found = []
+    if os.path.isdir("/proc/self"):
+        for entry in os.listdir("/proc"):
+            if entry.isdigit():
+                argv = command_line(int(entry))
+                if argv:
+                    found.append(argv)
+        return found
+    try:
+        listing = subprocess.run(["ps", "-axo", "command="], capture_output=True, text=True, errors="replace", timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return found
+    return [line.split() for line in listing.splitlines() if line.strip()]
+
+
+def command_line(pid):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return [a.decode("utf-8", "replace") for a in f.read().split(b"\0") if a]
+    except OSError:
+        return []
+
+
+def runs(argv, agent):
+    """Whether a command line is this agent (codex directly; pi through node or bun too)."""
+    names = [os.path.basename(a) for a in argv[:3]]
+    if agent == "codex":
+        return names[:1] == ["codex"]
+    return "pi" in names or any("pi-coding-agent" in a for a in argv[:3])
+
+
+# The id that resumes a conversation follows these words. A fork names its source too, but holds
+# only the new conversation, so `codex fork <id>` and `pi --fork <id>` hold nothing listed.
+OPENERS = {"codex": ("resume",), "pi": ("--session",)}
+
+
+def held_by_command_line(rows, agent, procs):
+    ids = {r["id"] for r in rows if r["agent"] == agent}
+    held = set()
+    for argv in procs:
+        if not runs(argv, agent):
+            continue
+        for before, word in zip(argv, argv[1:]):
+            if before in OPENERS[agent] and word in ids:
+                held.add(word)
+        if agent == "pi":
+            held.update(a[len("--session="):] for a in argv if a.startswith("--session=") and a[len("--session="):] in ids)
+    return held
+
+
+def lock_holders(path="/proc/locks"):
+    """{inode: holder pids} of locks held (Linux: /proc/locks)."""
+    holders = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                parts = line.split()
+                # "48: FLOCK  ADVISORY  WRITE 1009782 08:01:786440 0 EOF"; "->" marks a waiter
+                if len(parts) > 5 and parts[1] != "->" and parts[4].isdigit():
+                    inode = parts[5].rsplit(":", 1)[-1]
+                    if inode.isdigit():
+                        holders.setdefault(int(inode), set()).add(int(parts[4]))
+    except OSError:
+        pass
+    return holders
+
+
+def held_codex(rows, procs, holders=None):
+    """Threads a running codex writes: it locks thread-writer-locks/<id>.lock, or resumes the id by name."""
+    held = held_by_command_line(rows, "codex", procs)
+    holders = lock_holders() if holders is None else holders
+    if not holders:
+        return held
+    locks = os.path.join(CODEX_HOME, "thread-writer-locks")
+    try:
+        names = os.listdir(locks)
+    except OSError:
+        return held
+    for name in names:
+        if not name.endswith(".lock") or name.startswith("."):
+            continue
+        try:
+            pids = holders.get(os.stat(os.path.join(locks, name)).st_ino, ())
+        except OSError:
+            continue
+        # an inode number alone may belong to a lock on another disk: the holder must be codex
+        if any(runs(command_line(pid), "codex") for pid in pids):
+            held.add(name[:-5])
+    return held
+
+
+def held(rows):
+    procs = processes()
+    return held_claude() | held_codex(rows, procs) | held_by_command_line(rows, "pi", procs)
+
+
+# ---------- the list ----------
+
+def width(text):
+    return sum(2 if unicodedata.east_asian_width(ch) in "WF" else 1 for ch in text)
+
+
+def pad(text, cols):
+    if width(text) > cols:
+        keep = ""
+        for ch in reversed(text):
+            if width(keep) + width(ch) > cols - 1:
+                break
+            keep = ch + keep
+        text = "…" + keep
+    return text + " " * (cols - width(text))
+
+
+def ago(t):
+    s = int(time.time() - t)
+    if s < 3600:
+        return f"{max(1, s // 60)}分钟前"
+    if s < 86400:
+        return f"{s // 3600}小时前"
+    return f"{s // 86400}天前"
+
+
+def short(path):
+    return "~" + path[len(HOME):] if path == HOME or path.startswith(HOME + "/") else path
+
+
+def installed(agent):
+    return shutil.which(agent) is not None
+
+
+def present(agent):
+    """An agent worth a list: installed here, or with conversation files left from before."""
+    return installed(agent) or next(jsonl_files(session_roots()[agent]), None) is not None
+
+
+def tag(agent):
+    return f"{COLORS[agent]}{pad('[' + NAMES[agent] + ']', 8)}{RESET}"
+
+
+def rows_for(mode):
+    """Lines for fzf: action, agent, id, cwd, path, then what is shown (tab-separated)."""
+    rows = conversations(mode)
+    busy = held(rows)
+    lines = []
+    for agent in AGENTS:
+        if mode in ("all", agent) and installed(agent):
+            lines.append("\t".join(["new", agent, "", "", "", f"{COLORS[agent]}＋ 新建 {NAMES[agent]} 对话…{RESET}"]))
+    for r in rows:
+        mark = "●" if r["id"] in busy else " "
+        # on the mixed list every row names its agent; on one agent's list the prompt does
+        who = f"{tag(r['agent'])} " if mode == "all" else ""
+        title = r["title"][:140]
+        # the first thing said rides along (dim, mostly off screen) so it can be searched too
+        said = f"  {DIM}· {r['prompt'][:300]}{RESET}" if r["prompt"] and (r["prompt"] != r["title"] or len(r["title"]) > 140) else ""
+        shown = f"{mark} {pad(ago(r['mtime']), 8)} {who}{DIM}{pad(short(r['cwd']), 26)}{RESET} {title}{said}"
+        lines.append("\t".join(["resume", r["agent"], r["id"], r["cwd"], r["path"], shown]))
+    return lines
+
+
+def fzf_version():
+    try:
+        out = subprocess.run([fzf_bin(), "--version"], capture_output=True, text=True, errors="replace", timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    try:
+        return tuple(int(x) for x in out.split()[0].split(".")[:2])
+    except (IndexError, ValueError):
+        return (0, 0)
+
+
+def me():
+    return f"{shlex.quote(sys.executable)} -I {shlex.quote(os.path.abspath(__file__))}"
+
+
+def remember(mode):
+    try:
+        os.makedirs(STATE, exist_ok=True)
+        with open(os.path.join(STATE, "mode"), "w") as f:
+            f.write(mode)
+    except OSError:
+        pass
+
+
+def remembered():
+    try:
+        with open(os.path.join(STATE, "mode")) as f:
+            mode = f.read().strip()
+    except OSError:
+        return "all"
+    return mode if mode in MODES and (mode == "all" or present(mode)) else "all"
+
+
+def lists():
+    return ["all"] + [a for a in AGENTS if present(a)]
+
+
+def cycle(prompt):
+    """fzf's Ctrl-T: the next list after the one shown (all → Claude → Codex → Pi), skipping absent agents."""
+    order = lists()
+    now = next((m for m, p in PROMPTS.items() if p == prompt), "all")
+    nxt = order[(order.index(now) + 1) % len(order)] if now in order else "all"
+    remember(nxt)
+    return f"change-prompt({PROMPTS[nxt]})+reload({me()} --list {nxt})"
+
+
+def preview(agent, path="", ident="", cwd=""):
+    """A conversation's last few exchanges, for the side panel."""
+    if agent not in NAMES:
+        return
+    if not path:
+        print(f"新开一个 {NAMES[agent]} 对话：接下来选目录")
+        return
+    try:
+        size = os.path.getsize(path)
+        print(f"{NAMES[agent]} · {short(cwd)} · 更新于 {ago(os.path.getmtime(path))} · {ident}\n")
+    except OSError:
+        return
+    window, said = 600_000, []
+    while True:
+        start = max(0, size - window)
+        try:
+            with open(path, "rb") as f:
+                f.seek(start)
+                raw = f.read(size - start).split(b"\n")
+        except OSError:
+            return
+        # a window that starts mid-file starts mid-line
+        for row in raw[1 if start else 0:]:
+            d = parse(row)
+            if not d:
+                continue
+            try:
+                who, text = SAID[agent](d)
+            except BROKEN:
+                continue
+            if who and typed(text):
+                said.append(f"── {'你' if who == 'user' else NAMES[agent]}\n{text.strip()[:700]}")
+        if said or start == 0:
+            break
+        window *= 4
+    print("\n\n".join(said[-8:]) or "（还没有对话）")
+
+
+def pick(lines, prompt, query, header, extra_args):
+    try:
+        return subprocess.run(
+            [fzf_bin(), "--ansi", "--delimiter", "\t", "--with-nth", "6", "--no-sort", "--reverse", "--query", query,
+             "--prompt", prompt, "--header", header, *extra_args],
+            input="\n".join(lines), stdout=subprocess.PIPE, text=True, errors="replace",
+        )
+    except OSError:
+        sys.exit(NEED_FZF)
+
+
+# ---------- starting the agent ----------
+
+COMMANDS = {
+    "resume": {"claude": ["claude", "--resume", "{id}"], "codex": ["codex", "resume", "{id}"], "pi": ["pi", "--session", "{id}"]},
+    # a new conversation from this one's history; the original stays as it was. Pi forks into the
+    # folder it runs in, so it, like the others, runs in the conversation's folder.
+    "fork": {"claude": ["claude", "--resume", "{id}", "--fork-session"], "codex": ["codex", "fork", "{id}"], "pi": ["pi", "--fork", "{id}"]},
+    "new": {"claude": ["claude"], "codex": ["codex"], "pi": ["pi"]},
+}
+
+
+def run(agent, cwd, argv):
+    if not os.path.isdir(cwd):
+        sys.exit(f"目录不在了：{cwd}")
+    if not installed(agent):
+        sys.exit(f"这台机器上没有 {agent}")
+    print(f"→ {short(cwd)}  {' '.join(shlex.quote(a) for a in argv)}", file=sys.stderr)
+    if os.environ.get("AGENTS_DRY_RUN"):
+        print(json.dumps({"cwd": cwd, "argv": argv}))
+        return
+    # `agents .`'s folder was for this list only, not for what the agent starts
+    os.environ.pop("AGENTS_HERE", None)
+    os.chdir(cwd)
+    os.execvp(argv[0], argv)
+
+
+def launch(what, agent, cwd, extra, ident=""):
+    run(agent, cwd, [ident if a == "{id}" else a for a in COMMANDS[what][agent]] + extra)
+
+
+def resume(agent, ident, cwd, extra):
+    launch("resume", agent, cwd, extra, ident)
+
+
+def fork(agent, ident, cwd, extra):
+    launch("fork", agent, cwd, extra, ident)
+
+
+def update():
+    """Run the installer again, into the folder this copy lives in: the newest `agents`, and fzf if it is missing or old."""
+    url = f"https://raw.githubusercontent.com/{REPO}/main/install.sh"
+    fetch = ["curl", "-fsSL", url] if shutil.which("curl") else ["wget", "-qO-", url]
+    print(f"更新：{' '.join(fetch)} | sh", file=sys.stderr)
+    try:
+        got = subprocess.run(fetch, stdout=subprocess.PIPE)
+    except OSError:
+        sys.exit("更新失败：需要 curl 或 wget")
+    if got.returncode != 0 or not got.stdout:
+        sys.exit(f"更新失败：下载 {url} 出错")
+    env = dict(os.environ)
+    env.setdefault("AGENTS_BIN_DIR", os.path.dirname(os.path.abspath(__file__)))
+    sys.exit(subprocess.run(["sh"], input=got.stdout, env=env).returncode)
+
+
+def here():
+    try:
+        return os.getcwd()
+    except OSError:
+        sys.exit("当前目录已经不在了：先 cd 到一个存在的目录")
+
+
+def choose_dir(agent):
+    """Where to start a new conversation: a folder used before, or a path typed in."""
+    try:
+        start = [os.getcwd()]
+    except OSError:
+        start = []
+    seen, dirs = set(), []
+    for d in start + [r["cwd"] for r in conversations("all")] + [HOME]:
+        if d not in seen and "\t" not in d and "\n" not in d and os.path.isdir(d):
+            seen.add(d)
+            dirs.append(d)
+    lines = ["\t".join([d, "", "", "", "", short(d)]) for d in dirs]
+    res = pick(lines, f"在哪个目录新建 {NAMES[agent]} 对话 > ", "", "选一个用过的目录，或输入一个路径（/、~、./ 开头）后按 Enter", ["--print-query"])
+    # 0: a row was picked; 1: no row matched (the typed path may still be one); else Esc or an error
+    if res.returncode not in (0, 1):
+        return None
+    out = res.stdout.split("\n")
+    query = out[0].strip() if out else ""
+    # a typed path wins over a row that merely matches it fuzzily
+    if query.startswith(("/", "~", "./", "../")):
+        typed_dir = os.path.abspath(os.path.expanduser(query))
+        if os.path.isdir(typed_dir):
+            return typed_dir
+        sys.exit(f"没有这个目录：{typed_dir}")
+    chosen = out[1].split("\t")[0] if len(out) > 1 and out[1] else ""
+    return chosen or None
+
+
+def new(agent, cwd, extra):
+    if cwd is None:
+        cwd = choose_dir(agent)
+        if cwd is None:
+            return
+    launch("new", agent, cwd, extra)
+
+
+def busy_message(agent):
+    where = "先在那边退出（claude agents 里的后台会话要先停掉）" if agent == "claude" else "先在那边退出"
+    return f"这个对话正被另一个 {NAMES[agent]} 进程占着：{where}；或者重新运行 agents，在它上面按 Ctrl-O 分出一份。"
+
+
+# ---------- the command ----------
+
+def main(argv):
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="replace")
+    extra = []
+    if "--" in argv:
+        i = argv.index("--")
+        argv, extra = argv[:i], argv[i + 1:]
+    if argv[:1] == ["--version"]:
+        print(f"agents {VERSION}")
+        return
+    if argv[:1] in (["-h"], ["--help"]):
+        print(__doc__.strip())
+        return
+    if argv[:1] == ["--list"]:
+        mode = argv[1] if len(argv) > 1 and argv[1] in MODES else "all"
+        lines = rows_for(mode)
+        if lines:
+            print("\n".join(lines))
+        return
+    if argv[:1] == ["--cycle"]:
+        print(cycle(os.environ.get("FZF_PROMPT", "")))
+        return
+    if argv[:1] == ["--preview"]:
+        preview(*argv[1:5])
+        return
+    if argv[:1] == ["update"]:
+        return update()
+    if argv[:1] == ["new"]:
+        rest = argv[1:]
+        if rest and rest[0] in AGENTS:
+            agent = rest.pop(0)
+        else:
+            last = remembered()
+            agent = last if last in AGENTS and installed(last) else next((a for a in AGENTS if installed(a)), "claude")
+        cwd = None
+        if rest:
+            target = os.path.expanduser(rest[0])
+            cwd = target if os.path.isabs(target) else os.path.join(here(), target)
+            cwd = os.path.normpath(cwd)
+        return new(agent, cwd, extra)
+
+    mode = None
+    words = []
+    for a in argv:
+        if a in ["--" + m for m in MODES]:
+            mode = a[2:]
+        elif a in (".", "--here"):
+            os.environ["AGENTS_HERE"] = here()
+        else:
+            words.append(a)
+    if mode is None:
+        mode = remembered()
+    remember(mode)
+    version = fzf_version()
+    if version is None:
+        sys.exit(NEED_FZF)
+    keys = ["--expect", "ctrl-n,ctrl-o",
+            "--preview", f"{me()} --preview {{2}} {{5}} {{3}} {{4}}", "--preview-window", "down,45%,wrap",
+            "--bind", "ctrl-/:toggle-preview"]
+    switch = ""
+    if version >= FZF_MIN:
+        keys += ["--bind", f"ctrl-t:transform:{me()} --cycle"]
+        switch = "Ctrl-T 切换 " + "/".join(["全部"] + [NAMES[a] for a in lists()[1:]]) + " · "
+    where = f"只看 {short(os.environ['AGENTS_HERE'])} · " if os.environ.get("AGENTS_HERE") else ""
+    header = f"{where}Enter 恢复 · Ctrl-O 分支 · Ctrl-N 同目录新建 · {switch}Ctrl-/ 预览 · ● 正被占用"
+    res = pick(rows_for(mode), PROMPTS[mode], " ".join(words), header, keys)
+    out = res.stdout.split("\n")
+    if len(out) < 2 or not out[1]:
+        return
+    key, fields = out[0], out[1].split("\t")
+    if len(fields) < 4 or fields[1] not in AGENTS:
+        return
+    action, agent, ident, cwd = fields[:4]
+    if action == "new":
+        return new(agent, None, extra)
+    if key == "ctrl-n":
+        return new(agent, cwd, extra)
+    if key == "ctrl-o":
+        return fork(agent, ident, cwd, extra)
+    if ident in held(conversations(agent)):
+        sys.exit(busy_message(agent))
+    resume(agent, ident, cwd, extra)
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv[1:])
+    except KeyboardInterrupt:
+        sys.exit(130)
