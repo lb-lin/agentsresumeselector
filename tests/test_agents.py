@@ -326,16 +326,30 @@ class Held(Base):
 
 
 class Lists(Base):
-    def test_cycle_goes_through_every_present_agent(self):
-        order = [("全部 > ", "Claude > "), ("Claude > ", "Codex > "), ("Codex > ", "Pi > "), ("Pi > ", "全部 > ")]
-        for shown, nxt in order:
-            self.assertIn(f"change-prompt({nxt})", self.cr.cycle(shown))
-        self.assertIn("--list claude", self.cr.cycle("something else"))
+    def test_tab_goes_through_every_present_agent_and_shift_tab_back(self):
+        for nxt in ("claude", "codex", "pi", "all", "claude"):
+            self.assertIn(f"--list {nxt}", self.cr.cycle(1))
+            self.assertEqual(self.cr.remembered(), nxt)
+        self.assertIn("--list all", self.cr.cycle(-1))
+        self.assertIn("--list pi", self.cr.cycle(-1))
+
+    def test_the_switcher_highlights_the_list_shown(self):
+        out = self.cr.cycle(1)  # all -> claude
+        self.assertTrue(out.split("+")[-1].startswith("change-header:"))  # takes the rest of the line: last
+        bar = self.cr.switcher("codex")
+        for label in ("全部", "Claude", "Codex", "Pi"):
+            self.assertIn(f" {label} ", bar)
+        self.assertIn("\033[1;7m Codex ", bar)  # reverse video on the list shown
+        self.assertNotIn("\033[1;7m Claude ", bar)
+        self.assertIn("Tab", self.cr.header("all", footer=False))  # no footer: key help rides along
+        self.assertNotIn("Tab", self.cr.header("all", footer=True))
 
     def test_cycle_skips_an_agent_with_nothing_here(self):
         shutil.rmtree(self.pi)
+        self.cr.remember("codex")
         with mock.patch.object(self.cr.shutil, "which", lambda name: None):
-            self.assertIn("change-prompt(全部 > )", self.cr.cycle("Codex > "))
+            self.assertIn("--list all", self.cr.cycle(1))
+            self.assertNotIn(" Pi ", self.cr.switcher("all"))
         # a folder with no conversation files does not count either
         os.makedirs(os.path.join(self.pi, "sessions"))
         with mock.patch.object(self.cr.shutil, "which", lambda name: None):
@@ -343,8 +357,12 @@ class Lists(Base):
 
     def test_remembers_the_last_list(self):
         self.assertEqual(self.cr.remembered(), "all")
-        self.cr.cycle("Claude > ")
-        self.assertEqual(self.cr.remembered(), "codex")
+        self.cr.cycle(1)
+        self.cr.cycle(1)
+        self.assertEqual(self.load_again().remembered(), "codex")
+
+    def load_again(self):
+        return load(self.env)
 
     def shown(self, mode):
         return {r.split("\t")[2]: r.split("\t")[5] for r in self.cr.rows_for(mode) if r.startswith("resume")}
@@ -460,15 +478,16 @@ class Commands(Base):
         _, launched = self.run_agents("--all", pick="\taaaa\t", key="ctrl-o")  # forking it is fine
         self.assertEqual(launched["argv"][-1], "--fork-session")
 
-    def test_fzf_gets_the_bindings_and_the_list(self):
+    def test_fzf_gets_the_switcher_bindings_and_the_list(self):
         self.run_agents("--codex", "notes")
         args = self.fzf_calls()[-1]
         self.assertIn("ctrl-n,ctrl-o", args)
-        self.assertTrue(any(a.startswith("ctrl-t:transform:") for a in args))
+        self.assertTrue(any(a.startswith("tab:transform:") and a.endswith("--cycle next footer") for a in args))
+        self.assertTrue(any(a.startswith("btab:transform:") and a.endswith("--cycle back footer") for a in args))
         self.assertEqual(args[args.index("--query") + 1], "notes")
-        self.assertEqual(args[args.index("--prompt") + 1], "Codex > ")
-        header = args[args.index("--header") + 1]
-        self.assertIn("全部/Claude/Codex/Pi", header)
+        bar = args[args.index("--header") + 1]
+        self.assertIn("\033[1;7m Codex ", bar)
+        self.assertIn("Tab 切换列表", args[args.index("--footer") + 1])
 
     def test_this_folder_through_main(self):
         env = {"PWD": self.game}
@@ -511,12 +530,12 @@ class Commands(Base):
             f.write("codex")
         self.run_agents()
         args = self.fzf_calls()[-1]
-        self.assertEqual(args[args.index("--prompt") + 1], "Codex > ")
+        self.assertIn("\033[1;7m Codex ", args[args.index("--header") + 1])
         with open(os.path.join(self.env["XDG_STATE_HOME"], "agents", "mode"), "wb") as f:
             f.write(b"\xff")  # a damaged state file falls back to the mixed list
         self.run_agents()
         args = self.fzf_calls()[-1]
-        self.assertEqual(args[args.index("--prompt") + 1], "全部 > ")
+        self.assertIn("\033[1;7m 全部 ", args[args.index("--header") + 1])
 
     def test_the_agent_really_starts_in_the_conversations_folder(self):
         claude = os.path.join(self.bin, "claude")

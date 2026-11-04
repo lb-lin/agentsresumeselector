@@ -11,7 +11,7 @@ set -eu
 REPO="lb-lin/agentsresumeselector"
 REF="${AGENTS_REF:-main}"
 BIN="${AGENTS_BIN_DIR:-$HOME/.local/bin}"
-FZF_MIN="0.46"
+FZF_MIN="0.65"  # --footer, which the list switcher's layout uses
 
 say() { printf '%s\n' "$*" >&2; }
 die() { say "agents: $*"; exit 1; }

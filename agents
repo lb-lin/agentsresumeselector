@@ -2,7 +2,7 @@
 """agents: pick a Claude Code, Codex or Pi conversation, from any folder, and resume it there.
 
   agents                          the list you looked at last (all agents at first)
-  agents --all | --claude | --codex | --pi   start on that list (Ctrl-T switches in the list)
+  agents --all | --claude | --codex | --pi   start on that list (Tab switches in the list)
   agents <words>                  start with that filter
   agents .                        only conversations in this folder (and below)
   agents new [claude|codex|pi] [dir]   a new conversation (no dir: pick one)
@@ -11,10 +11,11 @@
 
 https://github.com/lb-lin/agentsresumeselector
 
-In the list: Enter resumes in the conversation's own folder, Ctrl-O forks it (a copy to go on
-from, the original stays as it was), Ctrl-N starts a new one with the same agent in that folder,
-Ctrl-T switches between all / Claude / Codex / Pi. When the agent exits you are back where you
-were. ● marks a conversation a running agent holds: it can be forked, not resumed.
+In the list: the switcher under the input shows which list you are on (all / Claude / Codex /
+Pi); Tab moves to the next, Shift-Tab back. Enter resumes in the conversation's own folder,
+Ctrl-O forks it (a copy to go on from, the original stays as it was), Ctrl-N starts a new one
+with the same agent in that folder. When the agent exits you are back where you were.
+● marks a conversation a running agent holds: it can be forked, not resumed.
 """
 import json
 import mmap
@@ -27,7 +28,7 @@ import sys
 import time
 import unicodedata
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 REPO = "lb-lin/agentsresumeselector"
 HOME = os.path.expanduser("~")
 CLAUDE_HOME = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude")
@@ -57,8 +58,9 @@ NAMES = {"claude": "Claude", "codex": "Codex", "pi": "Pi"}
 COLORS = {"claude": "\033[38;5;173m", "codex": "\033[38;5;75m", "pi": "\033[38;5;114m"}
 DIM, RESET = "\033[2m", "\033[0m"
 MODES = ("all",) + AGENTS
-PROMPTS = {"all": "全部 > ", "claude": "Claude > ", "codex": "Codex > ", "pi": "Pi > "}
-FZF_MIN = (0, 46)  # transform and $FZF_PROMPT
+LABELS = {"all": "全部", "claude": "Claude", "codex": "Codex", "pi": "Pi"}
+FZF_SWITCH = (0, 46)  # the transform action, which switching lists needs
+FZF_FOOTER = (0, 65)  # --footer: key help under the list, the switcher alone above it
 NEED_FZF = "需要 fzf：重新运行安装命令，或从 https://github.com/junegunn/fzf 安装"
 BROKEN = (ValueError, TypeError, AttributeError, KeyError, IndexError, RecursionError)
 
@@ -670,13 +672,34 @@ def lists():
     return ["all"] + [a for a in AGENTS if present(a)]
 
 
-def cycle(prompt):
-    """fzf's Ctrl-T: the next list after the one shown (all → Claude → Codex → Pi), skipping absent agents."""
+KEYS_HELP = "Tab 切换列表 · Enter 恢复 · Ctrl-O 分支 · Ctrl-N 同目录新建 · Ctrl-/ 预览 · ● 正被占用"
+
+
+def switcher(mode):
+    """The lists, the one shown highlighted in its agent's color: 全部  Claude  Codex  Pi."""
+    parts = []
+    for m in lists():
+        if m == mode:
+            parts.append(f"{COLORS.get(m, '')}\033[1;7m {LABELS[m]} {RESET}")
+        else:
+            parts.append(f"{DIM} {LABELS[m]} {RESET}")
+    where = f"   {DIM}只看 {short(os.environ['AGENTS_HERE'])}{RESET}" if os.environ.get("AGENTS_HERE") else ""
+    return " ".join(parts) + where
+
+
+def header(mode, footer):
+    """What sits under the input: the switcher, and the key help when there is no footer for it."""
+    return switcher(mode) if footer else f"{switcher(mode)}   {DIM}{KEYS_HELP}{RESET}"
+
+
+def cycle(step=1, footer=True):
+    """Tab / Shift-Tab: the next (or previous) list, skipping absent agents. The list shown is the remembered one."""
     order = lists()
-    now = next((m for m, p in PROMPTS.items() if p == prompt), "all")
-    nxt = order[(order.index(now) + 1) % len(order)] if now in order else "all"
+    now = remembered()
+    nxt = order[(order.index(now) + step) % len(order)] if now in order else "all"
     remember(nxt)
-    return f"change-prompt({PROMPTS[nxt]})+reload({me()} --list {nxt})"
+    # change-header: takes the rest of the line, so it comes last
+    return f"reload({me()} --list {nxt})+change-header:{header(nxt, footer)}"
 
 
 def preview(agent, path="", ident="", cwd=""):
@@ -858,7 +881,8 @@ def main(argv):
             print("\n".join(lines))
         return
     if argv[:1] == ["--cycle"]:
-        print(cycle(os.environ.get("FZF_PROMPT", "")))
+        # --cycle [next|back] [footer|inline]
+        print(cycle(-1 if "back" in argv[1:] else 1, "inline" not in argv[1:]))
         return
     if argv[:1] == ["--preview"]:
         preview(*argv[1:5])
@@ -901,13 +925,17 @@ def main(argv):
     keys = ["--expect", "ctrl-n,ctrl-o",
             "--preview", f"{me()} --preview {{2}} {{5}} {{3}} {{4}}", "--preview-window", "down,45%,wrap",
             "--bind", "ctrl-/:toggle-preview"]
-    switch = ""
-    if version >= FZF_MIN:
-        keys += ["--bind", f"ctrl-t:transform:{me()} --cycle"]
-        switch = "Ctrl-T 切换 " + "/".join(["全部"] + [NAMES[a] for a in lists()[1:]]) + " · "
-    where = f"只看 {short(os.environ['AGENTS_HERE'])} · " if os.environ.get("AGENTS_HERE") else ""
-    header = f"{where}Enter 恢复 · Ctrl-O 分支 · Ctrl-N 同目录新建 · {switch}Ctrl-/ 预览 · ● 正被占用"
-    res = pick(rows_for(mode), PROMPTS[mode], " ".join(words), header, keys)
+    footer = version >= FZF_FOOTER
+    layout = "footer" if footer else "inline"
+    if version >= FZF_SWITCH:
+        forward, back = f"transform:{me()} --cycle next {layout}", f"transform:{me()} --cycle back {layout}"
+        keys += ["--bind", f"tab:{forward}", "--bind", f"ctrl-t:{forward}", "--bind", f"btab:{back}"]
+        top = header(mode, footer)
+    else:
+        top = f"{DIM}{KEYS_HELP.replace('Tab 切换列表 · ', '')}{RESET}  （fzf 0.46 以上才能切换列表：运行 agents update）"
+    if footer:
+        keys += ["--footer", f"{DIM}{KEYS_HELP}{RESET}"]
+    res = pick(rows_for(mode), "> ", " ".join(words), top, keys)
     out = res.stdout.split("\n")
     if len(out) < 2 or not out[1]:
         return
